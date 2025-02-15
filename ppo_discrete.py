@@ -15,12 +15,15 @@ import tyro as tyro
 import yaml
 
 # import custom_envs
+from stable_baselines3.common.utils import get_latest_run_id
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
 # from PROPS.gridworld_clean.compute_true_gradient import compute_gradient
-from utils import get_latest_run_id
 from collections import deque
+
+from utils import simulate
+
 
 @dataclass
 class Args:
@@ -51,8 +54,8 @@ class Args:
     algo: str = 'ppo'
 
     # Sampling algorithm
-    sampling_algo: str = 'props'
-    # sampling_algo: str = 'on_policy'
+    # sampling_algo: str = 'props'
+    sampling_algo: str = 'on_policy'
 
     # Algorithm specific arguments
     env_id: str = "CartPole-v1"
@@ -146,12 +149,18 @@ class Agent(nn.Module):
             action = probs.sample()
         return action, probs.log_prob(action), probs.entropy(), self.critic(x)
 
-    def get_action(self, x, action=None):
+    def get_action_and_info(self, x, action=None):
         logits = self.actor(x)
         probs = Categorical(logits=logits)
         if action is None:
             action = probs.sample()
         return action, probs.log_prob(action), probs.entropy()
+
+    def get_action(self, x):
+        logits = self.actor(x)
+        probs = Categorical(logits=logits)
+        action = probs.sample()
+        return action
 
     def get_pi_at_s(self, x):
         with torch.no_grad():
@@ -364,116 +373,6 @@ def props_update(
 
     ################################## END TARGET UPDATE ##################################
 
-
-def simulate(env, actor, eval_episodes, eval_steps=np.inf):
-    logs = defaultdict(list)
-    sa_count = np.zeros(shape=(env.observation_space.shape[0], env.action_space.n))
-    step = 0
-    for episode_i in range(eval_episodes):
-        logs_episode = defaultdict(list)
-
-        obs, _ = env.reset()
-        done = False
-
-        while not done:
-
-            # ALGO LOGIC: put action logic here
-            with torch.no_grad():
-                actions, _, _ = actor.get_action(torch.Tensor(obs).to('cpu'))
-                actions = actions.cpu().numpy()
-
-            s_idx = np.argmax(obs)
-            a_idx = actions
-            sa_count[s_idx, a_idx] += 1
-
-            # TRY NOT TO MODIFY: execute the game and log data.
-            next_obs, rewards, terminateds, truncateds, infos = env.step(actions)
-            done = terminateds or truncateds
-
-            # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
-            obs = next_obs
-
-            logs_episode['rewards'].append(rewards)
-
-            step += 1
-
-            if step >= eval_steps:
-                break
-        if step >= eval_steps:
-            break
-
-
-        logs['returns'].append(np.sum(logs_episode['rewards']))
-        try:
-            logs['successes'].append(infos['is_success'])
-        except:
-            logs['successes'].append(False)
-
-    return_avg = np.mean(logs['returns'])
-    return_std = np.std(logs['returns'])
-    success_avg = np.mean(logs['successes'])
-    success_std = np.std(logs['successes'])
-    return return_avg, return_std, success_avg, success_std, sa_count
-    # return np.array(eval_returns), np.array(eval_obs), np.array(eval_actions), np.array(eval_rewards), sa_counts
-
-
-
-def simulate_fast(env, actor, eval_episodes, eval_steps=np.inf):
-    logs = defaultdict(list)
-    sa_count = np.zeros(shape=(env.observation_space.shape[0], env.action_space.n))
-    step = 0
-
-    pi = actor.get_pi()
-    for episode_i in range(eval_episodes):
-        logs_episode = defaultdict(list)
-
-        obs, _ = env.reset()
-        done = False
-
-        while not done:
-
-            # ALGO LOGIC: put action logic here
-            with torch.no_grad():
-                s_idx = np.argmax(obs)
-                pi_at_s = pi[s_idx]
-                actions = np.random.choice(np.arange(env.action_space.n), p=pi_at_s)
-                # print(pi_at_s, actions)
-
-            a_idx = actions
-            sa_count[s_idx, a_idx] += 1
-
-            # TRY NOT TO MODIFY: execute the game and log data.
-            next_obs, rewards, terminateds, truncateds, infos = env.step(actions)
-            done = terminateds or truncateds
-
-            # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
-            obs = next_obs
-
-            logs_episode['rewards'].append(rewards)
-
-            step += 1
-
-            if step >= eval_steps:
-                break
-        if step >= eval_steps:
-            break
-
-
-        logs['returns'].append(np.sum(logs_episode['rewards']))
-        try:
-            logs['successes'].append(infos['is_success'])
-        except:
-            logs['successes'].append(False)
-
-    return_avg = np.mean(logs['returns'])
-    return_std = np.std(logs['returns'])
-    success_avg = np.mean(logs['successes'])
-    success_std = np.std(logs['successes'])
-    return return_avg, return_std, success_avg, success_std, sa_count
-    # return np.array(eval_returns), np.array(eval_obs), np.array(eval_actions), np.array(eval_rewards), sa_counts
-
-
-
 def compute_se(args, agent, agent_props, obs, actions, global_step, envs):
     # COMPUTE SAMPLING ERROR
 
@@ -544,8 +443,6 @@ def compute_se(args, agent, agent_props, obs, actions, global_step, envs):
 
 
 def update_behavior_policy(args, global_step, envs, obs, logprobs, actions, agent_props, agent, optimizer_props):
-    # behavior_update += 1
-
     ### Flatten the batch
     b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
     b_logprobs = logprobs.reshape(-1)
@@ -560,10 +457,6 @@ def update_behavior_policy(args, global_step, envs, obs, logprobs, actions, agen
     ### Set props policy equal to current target policy
     for source_param, dump_param in zip(agent_props.parameters(), agent.parameters()):
         source_param.data.copy_(dump_param.data)
-    # Freeze the feature layers of the empirical policy (as done in the Robust On-policy Sampling (ROS) paper)
-    # params = [p for p in agent_props.actor.parameters()]
-    # for p in params[:4]:
-    #     p.requires_grad = False
 
     props_batch_size = len(b_obs)
     props_minibatch_size = max(int(props_batch_size // args.props_num_minibatches), props_batch_size)
@@ -606,108 +499,6 @@ def update_behavior_policy(args, global_step, envs, obs, logprobs, actions, agen
         if args.props_target_kl is not None and approx_kl > args.props_target_kl:
             break
 
-
-def update_behavior_policy2(agent_props, envs, props_optimizer, obs, actions, advantages, global_step, args):
-    # PROPS UPDATE
-
-
-    if global_step <= args.buffer_size - args.props_num_steps:
-        # If the replay buffer is not full, use all data in replay buffer for this update.
-        start = 0
-        end = global_step
-    else:
-        # If the replay buffer is full, exclude the oldest behavior batch from this update; that batch will be evicted
-        # before the next update and thus does not contribute to sampling error.
-        start = args.props_num_steps
-        end = args.buffer_size
-    # flatten the replay buffer data
-    b_obs = obs[start:end].reshape((-1,) + envs.single_observation_space.shape).to(args.device)
-    b_actions = actions[start:end].reshape((-1,) + envs.single_action_space.shape).to(args.device)
-    # b_logits = logits[start:end].reshape(-1)  # action logits for PPO policy
-    with torch.no_grad():
-        _, _, logprobs, _, _ = agent_props.get_action_and_value(b_obs, b_actions)
-    b_logprobs = logprobs.reshape(-1).to(args.device)
-
-    b_probs = torch.exp(logprobs).to(args.device)
-
-    if args.props_adv:
-        b_advantages = advantages[start:end].reshape(-1)
-
-    batch_size = b_obs.shape[0]
-    minibatch_size = min(args.props_minibatch_size, batch_size)
-    b_inds = np.arange(batch_size)
-    clipfracs = []
-
-    done_updating = False
-    num_update_minibatches = 0
-    pg_loss = None
-    kl_regularizer_loss = None
-    approx_kl_to_log = None
-    grad_norms = []
-
-    for epoch in range(args.props_update_epochs):
-        np.random.shuffle(b_inds)
-
-        for start in range(0, batch_size, minibatch_size):
-            end = start + minibatch_size
-            mb_inds = b_inds[start:end]
-            mb_obs = b_obs[mb_inds]
-            mb_actions = b_actions[mb_inds]
-            mb_probs = b_probs[mb_inds]
-            mb_logprobs = b_logprobs[mb_inds]
-
-            if args.props_adv:
-                # Do not zero-center advantages; we need to preserve A(s,a) = 0 for AW-PROPS
-                mb_advantages = b_advantages[mb_inds]
-                mb_advantages = (mb_advantages - 0) / (mb_advantages.std() + 1e-8)
-                mb_abs_advantages = torch.abs(mb_advantages)
-                # print(torch.mean(mb_abs_advantages), torch.std(mb_abs_advantages))
-
-            _, _, props_logprobs, entropy = agent_props.get_action_and_info(mb_obs, mb_actions)
-            props_logratio = props_logprobs - b_logprobs[mb_inds]
-            props_ratio = props_logratio.exp()
-
-            with torch.no_grad():
-                # calculate approx_kl http://joschu.net/blog/kl-approx.html
-                old_approx_kl = (-props_logratio).mean()
-                approx_kl = ((props_ratio - 1) - props_logratio).mean()
-                clipfracs += [((props_ratio - 1.0).abs() > args.props_clip_coef).float().mean().item()]
-
-
-                approx_kl_to_log = approx_kl
-
-            kl_regularizer_loss = (mb_probs*(mb_logprobs - props_logprobs)).mean()
-
-            pg_loss1 = props_ratio
-            pg_loss2 = torch.clamp(props_ratio, 1 - args.props_clip_coef, 1 + args.props_clip_coef)
-            if args.props_adv:
-                pg_loss = (torch.max(pg_loss1, pg_loss2) * mb_abs_advantages).mean()
-            else:
-                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-
-            if args.ros:
-                pg_loss = props_logratio.mean()
-
-            entropy_loss = entropy.mean()
-            loss = pg_loss + args.props_lambda * kl_regularizer_loss
-
-            props_optimizer.zero_grad()
-            loss.backward()
-
-            grad_norm = nn.utils.clip_grad_norm_(agent_props.parameters(), args.props_max_grad_norm)
-            grad_norms.append(grad_norm.detach().cpu().numpy())
-
-            props_optimizer.step()
-            num_update_minibatches += 1
-
-        if args.props_target_kl:
-            # print(approx_kl)
-            if approx_kl > args.props_target_kl:
-                done_updating = True
-                break
-
-        if done_updating:
-            break
 def run():
     args = tyro.cli(Args)
     args.batch_size = int(args.num_envs * args.num_steps)
@@ -742,7 +533,7 @@ def run():
     if args.run_id is not None:
         args.output_dir += f"/run_{args.run_id}"
     else:
-        run_id = get_latest_run_id(save_dir=args.output_dir) + 1
+        run_id = get_latest_run_id(log_path=args.output_dir, log_name='run_') + 1
         args.output_dir += f"/run_{run_id}"
 
     ### Dump training config to save dir
@@ -764,11 +555,6 @@ def run():
             monitor_gym=True,
             save_code=True,
         )
-    # writer = SummaryWriter(f"runs/{run_name}")
-    # writer.add_text(
-    #     "hyperparameters",
-    #     "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
-    # )
 
     # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
@@ -804,7 +590,6 @@ def run():
     logs_sampling_error = defaultdict(list)
 
     target_update_count = 0
-    behavior_update_count = 0
 
     # ALGO Logic: Storage setup
     obs = torch.zeros((args.buffer_size * args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
@@ -815,20 +600,6 @@ def run():
     values = torch.zeros((args.buffer_size * args.num_steps, args.num_envs)).to(device)
     agent_history = deque(maxlen=args.buffer_size)
     envs_history = deque(maxlen=args.buffer_size)
-
-    ### Oracle adaptive sampling setup
-    sa_counts = np.zeros(shape=(envs.single_observation_space.shape[-1], envs.single_action_space.n))
-    possible_actions = np.arange(envs.single_action_space.n)
-
-    ### Load exact gradient
-    if 'Chain' in args.env_id or 'GridWorld' in args.env_id:
-        # sa_occupancy_true = np.load(f'gridworld_clean/data/{args.env_id}/non_uniform/sa_occupancy_true.npy')
-        # grad_true = np.load(f'gridworld_clean/data/{args.env_id}/non_uniform/grad_true.npy')
-        # adv_true = np.load(f'gridworld_clean/data/{args.env_id}/non_uniform/adv_true.npy')
-        sa_occupancy_true = np.load(f'gridworld_clean/data/{args.env_id}/sa_occupancy_true.npy')
-        grad_true = np.load(f'gridworld_clean/data/{args.env_id}/grad_true.npy')
-        adv_true = np.load(f'gridworld_clean/data/{args.env_id}/adv_true.npy')
-        grad_true_norm = np.linalg.norm(grad_true)
 
     # TRY NOT TO MODIFY: start the game
     global_step = 0
@@ -845,9 +616,8 @@ def run():
             lrnow = frac * args.learning_rate
             optimizer.param_groups[0]["lr"] = lrnow
 
-        agent_history.append(copy.deepcopy(agent))
-        envs_history.append(copy.deepcopy(envs))
-        # sa_counts[:] = 0
+        # agent_history.append(copy.deepcopy(agent))
+        # envs_history.append(copy.deepcopy(envs))
 
         for step in range(0, args.num_steps):
             global_step += args.num_envs
@@ -859,34 +629,12 @@ def run():
                 if args.sampling_algo in ['props', 'ros']:
                     action, _, _, _ = agent_props.get_action_and_value(next_obs)
                     _, logprob, _, value = agent.get_action_and_value(next_obs, action=action)
-                    a_idx = action[0].item()
-                elif args.sampling_algo == 'greedy_adaptive':
-                    s_idx = np.argmax(next_obs)
-                    # print(s_idx)
-                    sa = sa_counts[s_idx]
-                    pi = agent.get_pi_at_s(next_obs)[0]
-                    # pi = np.array([0.5, 0.5])
-                    if np.sum(sa) == 0:
-                        a_idx = np.random.choice(possible_actions, p=pi)
-                    else:
-                        pi_empirical = sa / np.sum(sa)
-                        a_idx = np.argmin(pi_empirical - agent.get_pi_at_s(next_obs))
-
-                    action = torch.Tensor([a_idx])
-                    _, logprob, _, value = agent.get_action_and_value(next_obs, action)
-                elif args.sampling_algo == 'oracle_adaptive':
-                    raise NotImplementedError()
                 else:
                     action, logprob, _, value = agent.get_action_and_value(next_obs)
-                    a_idx = action[0].item()
-                    # a_idx = np.random.choice(possible_actions, p=[0.1, 0.1, 0.1, 0.7])
 
                 values[buffer_pos] = value.flatten()
             actions[buffer_pos] = action
             logprobs[buffer_pos] = logprob
-
-            # s_idx = np.where(next_obs[0] == 1)[0][0]
-            # sa_counts[s_idx, a_idx] += 1
 
             # TRY NOT TO MODIFY: execute the game and log data.
             next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
@@ -897,55 +645,7 @@ def run():
             buffer_pos += 1
             buffer_pos %= args.buffer_size * args.num_steps
             # buffer_pos = np.clip(buffer_pos, a_min=0, a_max=args.num_steps-1)
-            # if "final_info" in infos:
-            #     for info in infos["final_info"]:
-            #         if info and "episode" in info:
-                        # print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                        # writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                        # writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
 
-            if args.se_freq and global_step % args.se_freq == 0:
-                if 'Chain' in args.env_id or 'GridWorld' in args.env_id:
-
-                    b_obs = obs[:buffer_pos].reshape((-1,) + envs.single_observation_space.shape)
-                    b_actions = actions[:buffer_pos].reshape((-1,) + envs.single_action_space.shape)
-                    b_obs = b_obs.detach().numpy()
-                    b_actions = b_actions.detach().numpy()
-
-                    # print(global_step, buffer_pos)
-                    # sa_counts[:] = 0
-                    for o, a in zip(b_obs, b_actions):
-                        s_idx = np.where(o == 1)[0][0]
-                        # a_idx = a[0]
-                        a_idx = int(a)
-                        sa_counts[s_idx, a_idx] += 1
-
-                    grad_empirical = compute_gradient(envs.envs[0].unwrapped, agent.get_pi(), b_obs, b_actions.astype(int), adv_true)
-                    # grad_empirical_norm = np.linalg.norm(grad_empirical)
-                    grad_accuracy = (grad_empirical @ grad_true) / np.linalg.norm(grad_empirical) / grad_true_norm
-
-                    logs_sampling_error['grad'].append(grad_empirical)
-                    logs_sampling_error['grad_true'].append(grad_true)
-                    logs_sampling_error['grad_accuracy'].append(grad_accuracy)
-
-                    sa_occupancy = sa_counts / sa_counts.sum()
-                    se = np.abs(sa_occupancy - sa_occupancy_true).sum()
-                    # print(sa_occupancy)
-
-                    logs_sampling_error['sampling_error'].append(se)
-                    logs_sampling_error['sa_occupancy'].append(sa_occupancy)
-                    logs_sampling_error['sa_occupancy_true'].append(sa_occupancy_true)
-
-                    # print(se)
-                else:
-                    kl_mle_target = compute_se(args, agent, agent_props, obs, actions, global_step, envs)
-                    logs_sampling_error['sampling_error'].append(kl_mle_target)
-
-                logs_sampling_error['timestep'].append(global_step)
-                np.savez(
-                    f'{args.output_dir}/sampling_error.npz',
-                    **logs_sampling_error,
-                )
 
             ################################## START BEHAVIOR UPDATE ##################################
             if args.sampling_algo in ['ros', 'props'] and global_step % args.props_num_steps == 0:
@@ -999,44 +699,20 @@ def run():
 
 
         if iteration % args.eval_freq == 0:
-            return_avg, return_std, success_avg, success_std, _ = \
-                simulate(env=env_eval, actor=agent, eval_episodes=args.eval_episodes)
-            #
-            # # collect on-policy data
-            # _, _, _, _, sa_counts_on_policy = \
-            #     simulate(env=copy.deepcopy(envs_history[-1].envs[0]), actor=agent_history[-1], eval_episodes=1000, eval_steps=args.num_steps)
-            #
-            # # collect a lot of on-policy data to approximate the true distribution
-            # _, _, _, _, sa_counts_true = \
-            #     simulate_fast(env=copy.deepcopy(envs_history[-1].envs[0]), actor=agent_history[-1], eval_episodes=10000)
-            #
-            #
-
-            # sa_occupancy_true = sa_counts_true / sa_counts_true.sum()
-            # sa_occupancy_on_policy = sa_counts_on_policy / sa_counts_on_policy.sum()
-            # sa_occupancy = sa_counts / sa_counts.sum()
-            #
-            # se = np.abs(sa_occupancy - sa_occupancy_true).sum()
-            # se_on_policy = np.abs(sa_occupancy_on_policy - sa_occupancy_true).sum()
-            #
-            # # print(sa_occupancy)
-            #
-            # print(se)
-            # print(se_on_policy)
-            # logs_sampling_error['sampling_error'].append(se)
-            # logs_sampling_error['sampling_error_on_policy'].append(se_on_policy)
-            # # logs['sa_occupancy_eval'].append(sa_counts_eval)
-            # # logs_sampling_error['sa_occupancy'].append(sa_occupancy)
-            # # logs_sampling_error['sa_occupancy_true'].append(sa_occupancy_true)
-
-            print(f"Eval num_timesteps={global_step}, " f"episode_return={return_avg:.2f} +/- {return_std:.2f}")
-            print(f"Eval num_timesteps={global_step}, " f"episode_success={success_avg:.2f} +/- {success_std:.2f}")
-            print()
+            return_avg, return_std, success_avg, success_std = simulate(env=env_eval, actor=agent, eval_episodes=args.eval_episodes)
+            print(
+                f"Eval num_timesteps={global_step}, " f"episode_return={return_avg:.2f} +/- {return_std:.2f}\n"
+                f"Eval num_timesteps={global_step}, " f"episode_success={success_avg:.2f} +/- {success_std:.2f}\n"
+            )
 
             logs['timestep'].append(global_step)
             logs['return'].append(return_avg)
             logs['success_rate'].append(success_avg)
             logs['target_update'].append(target_update_count)
+
+            if args.se_freq:
+                kl_mle_target = compute_se(args, agent, agent_props, obs, actions, global_step, envs)
+                logs['sampling_error'].append(kl_mle_target)
 
             np.savez(
                 f'{args.output_dir}/evaluations.npz',
