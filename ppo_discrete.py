@@ -172,6 +172,199 @@ class Agent(nn.Module):
         return np.array(pi)
 
 
+def ppo_update(
+        agent,  # Policy network (actor-critic architecture)
+        optimizer,  # Optimizer (typically Adam)
+        b_obs,  # Batch of observations (states)
+        b_actions,  # Batch of actions taken
+        b_logprobs,  # Batch of log probabilities of taken actions
+        b_advantages,  # Batch of advantage estimates
+        b_returns,  # Batch of returns (discounted rewards)
+        b_values,  # Batch of value estimates
+        args,  # Arguments containing hyperparameters
+):
+    """
+    Performs a PPO policy update step using minibatching and clipped objectives.
+
+    Args:
+        agent: The actor-critic policy network that is being updated
+        optimizer: The optimizer (typically Adam) used for updating the policy
+        b_obs (torch.Tensor): Batch of observations/states from the environment
+        b_actions (torch.Tensor): Batch of actions taken in the environment
+        b_logprobs (torch.Tensor): Log probabilities of the actions taken under the old policy
+        b_advantages (torch.Tensor): Computed advantage estimates for each timestep
+        b_returns (torch.Tensor): Computed returns (discounted sum of rewards)
+        b_values (torch.Tensor): Value estimates from the old policy
+        args: Object containing PPO hyperparameters including:
+            - num_minibatches (int): Number of minibatches to split the data into
+            - update_epochs (int): Number of epochs to update on the same batch of data
+            - clip_coef (float): PPO clipping coefficient (epsilon in the paper)
+            - norm_adv (bool): Whether to normalize advantages
+            - clip_vloss (bool): Whether to use clipped value loss
+            - ent_coef (float): Entropy bonus coefficient
+            - vf_coef (float): Value function loss coefficient
+            - max_grad_norm (float): Maximum gradient norm for clipping
+            - target_kl (float, optional): Target KL divergence threshold for early stopping
+        target_update_count (int, optional): Counter for tracking target network updates
+    """
+    ### Target policy (and value network) update
+    batch_size = len(b_obs)
+    minibatch_size = max(batch_size // args.num_minibatches, batch_size)
+    b_inds = np.arange(batch_size)
+    clipfracs = []
+    for epoch in range(args.update_epochs):
+        np.random.shuffle(b_inds)
+        for start in range(0, batch_size, minibatch_size):
+            end = start + minibatch_size
+            mb_inds = b_inds[start:end]
+
+            _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
+            logratio = newlogprob - b_logprobs[mb_inds]
+            ratio = logratio.exp()
+
+            with torch.no_grad():
+                # calculate approx_kl http://joschu.net/blog/kl-approx.html
+                # old_approx_kl = (-logratio).mean()
+                approx_kl = ((ratio - 1) - logratio).mean()
+                clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
+
+            mb_advantages = b_advantages[mb_inds]
+            if args.norm_adv:
+                mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
+
+            # Policy loss
+            pg_loss1 = -mb_advantages * ratio
+            pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
+            pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+            # Value loss
+            newvalue = newvalue.view(-1)
+            if args.clip_vloss:
+                v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
+                v_clipped = b_values[mb_inds] + torch.clamp(
+                    newvalue - b_values[mb_inds],
+                    -args.clip_coef,
+                    args.clip_coef,
+                )
+                v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
+                v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
+                v_loss = 0.5 * v_loss_max.mean()
+            else:
+                v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
+
+            entropy_loss = entropy.mean()
+            loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
+
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+            optimizer.step()
+
+        if args.target_kl is not None and approx_kl > args.target_kl:
+            break
+
+    # y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
+    # var_y = np.var(y_true)
+    # explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
+
+    # TRY NOT TO MODIFY: record rewards for plotting purposes
+    # writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
+    # writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
+    # writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
+    # writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
+    # writer.add_scalar("losses/old_approx_kl", old_approx_kl.item(), global_step)
+    # writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
+    # writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
+    # writer.add_scalar("losses/explained_variance", explained_var, global_step)
+    # writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+
+    ################################## END TARGET UPDATE ##################################
+
+def props_update(
+        agent,  # Policy network (actor-critic architecture)
+        optimizer,  # Optimizer (typically Adam)
+        b_obs,  # Batch of observations (states)
+        b_actions,  # Batch of actions taken
+        b_logprobs,  # Batch of log probabilities of taken actions
+        args,  # Arguments containing hyperparameters
+):
+    """
+    Performs a PROPS policy update step using minibatching and clipped objectives.
+
+    Args:
+        agent: The actor-critic policy network that is being updated
+        optimizer: The optimizer (typically Adam) used for updating the policy
+        b_obs (torch.Tensor): Batch of observations/states from the environment
+        b_actions (torch.Tensor): Batch of actions taken in the environment
+        b_logprobs (torch.Tensor): Log probabilities of the actions taken under the old policy
+        b_advantages (torch.Tensor): Computed advantage estimates for each timestep
+        b_returns (torch.Tensor): Computed returns (discounted sum of rewards)
+        b_values (torch.Tensor): Value estimates from the old policy
+        args: Object containing PROPS hyperparameters including:
+            - num_minibatches (int): Number of minibatches to split the data into
+            - update_epochs (int): Number of epochs to update on the same batch of data
+            - clip_coef (float): PROPS clipping coefficient (epsilon in the paper)
+            - norm_adv (bool): Whether to normalize advantages
+            - clip_vloss (bool): Whether to use clipped value loss
+            - ent_coef (float): Entropy bonus coefficient
+            - vf_coef (float): Value function loss coefficient
+            - max_grad_norm (float): Maximum gradient norm for clipping
+            - target_kl (float, optional): Target KL divergence threshold for early stopping
+    """
+    ### Target policy (and value network) update
+    batch_size = len(b_obs)
+    minibatch_size = max(batch_size // args.props_num_minibatches, batch_size)
+    b_inds = np.arange(batch_size)
+    clipfracs = []
+    for epoch in range(args.props_update_epochs):
+        np.random.shuffle(b_inds)
+        for start in range(0, batch_size, minibatch_size):
+            end = start + minibatch_size
+            mb_inds = b_inds[start:end]
+
+            _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
+            logratio = newlogprob - b_logprobs[mb_inds]
+            ratio = logratio.exp()
+
+            with torch.no_grad():
+                # calculate approx_kl http://joschu.net/blog/kl-approx.html
+                # old_approx_kl = (-logratio).mean()
+                approx_kl = ((ratio - 1) - logratio).mean()
+                clipfracs += [((ratio - 1.0).abs() > args.props_clip_coef).float().mean().item()]
+
+            # Policy loss
+            pg_loss1 = ratio
+            pg_loss2 = torch.clamp(ratio, 1 - args.props_clip_coef, 1 + args.props_clip_coef)
+            pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+            loss = pg_loss
+
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(agent.parameters(), args.props_max_grad_norm)
+            optimizer.step()
+
+        if args.props_target_kl is not None and approx_kl > args.props_target_kl:
+            break
+
+    # y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
+    # var_y = np.var(y_true)
+    # explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
+
+    # TRY NOT TO MODIFY: record rewards for plotting purposes
+    # writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
+    # writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
+    # writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
+    # writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
+    # writer.add_scalar("losses/old_approx_kl", old_approx_kl.item(), global_step)
+    # writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
+    # writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
+    # writer.add_scalar("losses/explained_variance", explained_var, global_step)
+    # writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+
+    ################################## END TARGET UPDATE ##################################
+
+
 def simulate(env, actor, eval_episodes, eval_steps=np.inf):
     logs = defaultdict(list)
     sa_count = np.zeros(shape=(env.observation_space.shape[0], env.action_space.n))
@@ -756,11 +949,11 @@ def run():
 
             ################################## START BEHAVIOR UPDATE ##################################
             if args.sampling_algo in ['ros', 'props'] and global_step % args.props_num_steps == 0:
-                update_behavior_policy(args, global_step, envs, obs, logprobs, actions, agent_props, agent, optimizer_props)
-                # update_behavior_policy(agent_props, envs, optimizer_props, obs, actions, advantages, global_step, args)
+                props_update(agent_props, optimizer_props, b_obs, b_actions, b_logprobs, args)
             ################################## END BEHAVIOR UPDATE ##################################
 
         # bootstrap value if not done
+        # @TODO: make sure this runs over the most recent batch
         with torch.no_grad():
             next_value = agent.get_value(next_obs).reshape(1, -1)
             advantages = torch.zeros_like(rewards).to(device)
@@ -801,76 +994,7 @@ def run():
 
         ### Target policy (and value network) update
         target_update_count += 1
-        batch_size = len(b_obs)
-        minibatch_size = max(batch_size // args.num_minibatches, batch_size)
-        b_inds = np.arange(batch_size)
-        clipfracs = []
-        for epoch in range(args.update_epochs):
-            np.random.shuffle(b_inds)
-            for start in range(0, batch_size, minibatch_size):
-                end = start + minibatch_size
-                mb_inds = b_inds[start:end]
-
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
-                logratio = newlogprob - b_logprobs[mb_inds]
-                ratio = logratio.exp()
-
-                with torch.no_grad():
-                    # calculate approx_kl http://joschu.net/blog/kl-approx.html
-                    old_approx_kl = (-logratio).mean()
-                    approx_kl = ((ratio - 1) - logratio).mean()
-                    clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
-
-                mb_advantages = b_advantages[mb_inds]
-                if args.norm_adv:
-                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
-
-                # Policy loss
-                pg_loss1 = -mb_advantages * ratio
-                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
-                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-
-                # Value loss
-                newvalue = newvalue.view(-1)
-                if args.clip_vloss:
-                    v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
-                    v_clipped = b_values[mb_inds] + torch.clamp(
-                        newvalue - b_values[mb_inds],
-                        -args.clip_coef,
-                        args.clip_coef,
-                    )
-                    v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
-                    v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
-                    v_loss = 0.5 * v_loss_max.mean()
-                else:
-                    v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
-
-                entropy_loss = entropy.mean()
-                loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
-
-                optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
-                optimizer.step()
-
-            if args.target_kl is not None and approx_kl > args.target_kl:
-                break
-
-        y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
-        var_y = np.var(y_true)
-        explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
-
-        # TRY NOT TO MODIFY: record rewards for plotting purposes
-        # writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
-        # writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
-        # writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
-        # writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
-        # writer.add_scalar("losses/old_approx_kl", old_approx_kl.item(), global_step)
-        # writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
-        # writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
-        # writer.add_scalar("losses/explained_variance", explained_var, global_step)
-        # writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
-
+        ppo_update(agent, optimizer, b_obs, b_actions, b_logprobs, b_advantages, b_returns, b_values, args)
         ################################## END TARGET UPDATE ##################################
 
 
