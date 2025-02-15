@@ -40,7 +40,7 @@ class Args:
     output_subdir: str = ''
     run_id: int = None
     seed: int = 0
-    total_timesteps: int = 50000
+    total_timesteps: int = 300000
 
     # Evaluation
     eval_freq: int = 10
@@ -61,7 +61,7 @@ class Args:
     env_id: str = "CartPole-v1"
     learning_rate: float = 1e-3
     num_envs: int = 1
-    num_steps: int = 128
+    num_steps: int = 256
     anneal_lr: bool = False
     gamma: float = 0.99
     gae_lambda: float = 0.95
@@ -161,6 +161,11 @@ class Agent(nn.Module):
         probs = Categorical(logits=logits)
         action = probs.sample()
         return action
+
+    def get_logprob(self, x, action):
+        logits = self.actor(x)
+        probs = Categorical(logits=logits)
+        return probs.log_prob(action)
 
     def get_pi_at_s(self, x):
         with torch.no_grad():
@@ -513,11 +518,10 @@ def run():
         assert args.num_steps % args.props_num_steps == 0
 
     ### Seeding
-    if args.seed is None:
-        if args.run_id:
-            args.seed = np.random.randint(args.run_id)
-        else:
-            args.seed = np.random.randint(2 ** 32 - 1)
+    if args.seed is None and args.run_id:
+        args.seed = args.run_id
+    else:
+        args.seed = np.random.randint(2 ** 32 - 1)
 
     ### Override hyperparameters based on sampling method
     assert args.sampling_algo in ['on_policy', 'ros', 'props', 'greedy_adaptive', 'oracle_adaptive']
@@ -592,14 +596,14 @@ def run():
     target_update_count = 0
 
     # ALGO Logic: Storage setup
-    obs = torch.zeros((args.buffer_size * args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
-    actions = torch.zeros((args.buffer_size * args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
-    logprobs = torch.zeros((args.buffer_size * args.num_steps, args.num_envs)).to(device)
-    rewards = torch.zeros((args.buffer_size * args.num_steps, args.num_envs)).to(device)
-    dones = torch.zeros((args.buffer_size * args.num_steps, args.num_envs)).to(device)
-    values = torch.zeros((args.buffer_size * args.num_steps, args.num_envs)).to(device)
-    agent_history = deque(maxlen=args.buffer_size)
-    envs_history = deque(maxlen=args.buffer_size)
+    obs_buffer = torch.zeros((args.buffer_size * args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
+    actions_buffer = torch.zeros((args.buffer_size * args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
+    # logprobs_buffer = torch.zeros((args.buffer_size * args.num_steps, args.num_envs)).to(device)
+    rewards_buffer = torch.zeros((args.buffer_size * args.num_steps, args.num_envs)).to(device)
+    dones_buffer = torch.zeros((args.buffer_size * args.num_steps, args.num_envs)).to(device)
+    # values = torch.zeros((args.buffer_size * args.num_steps, args.num_envs)).to(device)
+    agent_buffer = deque(maxlen=args.buffer_size)
+    envs_buffer = deque(maxlen=args.buffer_size)
 
     # TRY NOT TO MODIFY: start the game
     global_step = 0
@@ -621,8 +625,8 @@ def run():
 
         for step in range(0, args.num_steps):
             global_step += args.num_envs
-            obs[buffer_pos] = next_obs
-            dones[buffer_pos] = next_done
+            obs_buffer[buffer_pos] = next_obs
+            dones_buffer[buffer_pos] = next_done
 
             # ALGO LOGIC: action logic
             with torch.no_grad():
@@ -630,16 +634,13 @@ def run():
                     action, _, _, _ = agent_props.get_action_and_value(next_obs)
                     _, logprob, _, value = agent.get_action_and_value(next_obs, action=action)
                 else:
-                    action, logprob, _, value = agent.get_action_and_value(next_obs)
-
-                values[buffer_pos] = value.flatten()
-            actions[buffer_pos] = action
-            logprobs[buffer_pos] = logprob
+                    action = agent.get_action(next_obs)
+            actions_buffer[buffer_pos] = action
 
             # TRY NOT TO MODIFY: execute the game and log data.
             next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
             next_done = np.logical_or(terminations, truncations)
-            rewards[buffer_pos] = torch.tensor(reward).to(device).view(-1)
+            rewards_buffer[buffer_pos] = torch.tensor(reward).to(device).view(-1)
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
 
             buffer_pos += 1
@@ -651,6 +652,24 @@ def run():
             if args.sampling_algo in ['ros', 'props'] and global_step % args.props_num_steps == 0:
                 props_update(agent_props, optimizer_props, b_obs, b_actions, b_logprobs, args)
             ################################## END BEHAVIOR UPDATE ##################################
+
+        # if global_step < args.buffer_size * args.num_steps:
+        obs = obs_buffer[:global_step]
+        actions = actions_buffer[:global_step]
+        rewards = rewards_buffer[:global_step]
+        dones = dones_buffer[:global_step]
+
+        # elif args.buffer_size > 1:
+        #     b_obs = torch.roll(b_obs, buffer_pos)
+        #     b_actions = torch.roll(b_actions, buffer_pos)
+
+        with torch.no_grad():
+            values = agent.get_value(obs).reshape(-1, args.num_envs)
+            logprobs = agent.get_logprob(obs, actions).reshape(-1, args.num_envs)
+
+        # elif args.buffer_size > 1:
+        #     b_obs = torch.roll(b_obs, buffer_pos)
+        #     b_actions = torch.roll(b_actions, buffer_pos)
 
         # bootstrap value if not done
         # @TODO: make sure this runs over the most recent batch
@@ -669,34 +688,18 @@ def run():
                 advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
             returns = advantages + values
 
-        ### Flatten the batch
+        ### Target policy (and value network) update
+        # flatten buffer data
         b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
         b_logprobs = logprobs.reshape(-1)
-        b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
+        b_actions = actions.reshape((-1,) + envs.single_action_space.shape).long()
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
 
-        if global_step < args.buffer_size * args.num_steps:
-            b_obs = b_obs[:global_step]
-            b_logprobs = b_logprobs[:global_step]
-            b_actions = b_actions[:global_step]
-            b_advantages = b_advantages[:global_step]
-            b_returns = b_returns[:global_step]
-            b_values = b_values[:global_step]
-        elif args.buffer_size > 1:
-            b_obs = torch.roll(b_obs, buffer_pos)
-            b_logprobs = torch.roll(b_logprobs, buffer_pos)
-            b_actions = torch.roll(b_actions, buffer_pos)
-            b_advantages = torch.roll(b_advantages, buffer_pos)
-            b_returns = torch.roll(b_returns, buffer_pos)
-            b_values = torch.roll(b_values, buffer_pos)
-
-        ### Target policy (and value network) update
         target_update_count += 1
         ppo_update(agent, optimizer, b_obs, b_actions, b_logprobs, b_advantages, b_returns, b_values, args)
         ################################## END TARGET UPDATE ##################################
-
 
         if iteration % args.eval_freq == 0:
             return_avg, return_std, success_avg, success_std = simulate(env=env_eval, actor=agent, eval_episodes=args.eval_episodes)
