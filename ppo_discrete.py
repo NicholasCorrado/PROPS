@@ -74,7 +74,7 @@ class Args:
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     target_kl: float = 0.03
-    buffer_batches: int = 1
+    buffer_batches: int = 2
 
     # Behavior
     props_num_steps: int = 16
@@ -600,10 +600,8 @@ def run():
     # ALGO Logic: Storage setup
     obs_buffer = torch.zeros((args.buffer_size, args.num_envs) + envs.single_observation_space.shape).to(device)
     actions_buffer = torch.zeros((args.buffer_size, args.num_envs) + envs.single_action_space.shape).to(device)
-    # logprobs_buffer = torch.zeros((args.buffer_size, args.num_envs)).to(device)
     rewards_buffer = torch.zeros((args.buffer_size, args.num_envs)).to(device)
     dones_buffer = torch.zeros((args.buffer_size, args.num_envs)).to(device)
-    # values = torch.zeros((args.buffer_size, args.num_envs)).to(device)
     agent_buffer = deque(maxlen=args.buffer_size)
     envs_buffer = deque(maxlen=args.buffer_size)
 
@@ -625,6 +623,12 @@ def run():
         # agent_history.append(copy.deepcopy(agent))
         # envs_history.append(copy.deepcopy(envs))
 
+        # shift buffers left by one batch. We will place the next batch we collect at the end of the buffer.
+        obs_buffer[:-args.num_steps] = obs_buffer[args.num_steps:]
+        actions_buffer[:-args.num_steps] = actions_buffer[args.num_steps:]
+        rewards_buffer[:-args.num_steps] = rewards_buffer[args.num_steps:]
+        dones_buffer[:-args.num_steps] = dones_buffer[args.num_steps:]
+
         for step in range(0, args.num_steps):
             global_step += args.num_envs
             obs_buffer[buffer_pos] = next_obs
@@ -645,9 +649,11 @@ def run():
             rewards_buffer[buffer_pos] = torch.tensor(reward).to(device).view(-1)
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
 
+            # Once the buffer is full, we only write to last batch in the buffer for all subsequent collection phases.
             buffer_pos += 1
-            buffer_pos %= args.buffer_size
-            # buffer_pos = np.clip(buffer_pos, a_min=0, a_max=args.num_steps-1)
+            if buffer_pos == args.buffer_size:
+                buffer_pos = args.buffer_size - args.num_steps
+
 
 
             ################################## START BEHAVIOR UPDATE ##################################
@@ -655,11 +661,16 @@ def run():
                 props_update(agent_props, optimizer_props, b_obs, b_actions, b_logprobs, args)
             ################################## END BEHAVIOR UPDATE ##################################
 
-        # if global_step < args.buffer_size:
-        obs = obs_buffer[:global_step]
-        actions = actions_buffer[:global_step]
-        rewards = rewards_buffer[:global_step]
-        dones = dones_buffer[:global_step]
+        if global_step < args.buffer_size:
+            obs = obs_buffer[:global_step]
+            actions = actions_buffer[:global_step]
+            rewards = rewards_buffer[:global_step]
+            dones = dones_buffer[:global_step]
+        else:
+            obs = obs_buffer
+            actions = actions_buffer
+            rewards = rewards_buffer
+            dones = dones_buffer
 
         # elif args.buffer_size > 1:
         #     b_obs = torch.roll(b_obs, buffer_pos)
