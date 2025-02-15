@@ -355,7 +355,7 @@ def props_update(
 
             optimizer.zero_grad()
             loss.backward()
-            nn.utils.clip_grad_norm_(agent.parameters(), args.props_max_grad_norm)
+            nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
             optimizer.step()
 
         if args.props_target_kl is not None and approx_kl > args.props_target_kl:
@@ -654,35 +654,28 @@ def run():
             if buffer_pos == args.buffer_size:
                 buffer_pos = args.buffer_size - args.num_steps
 
-
-
             ################################## START BEHAVIOR UPDATE ##################################
             if args.sampling_algo in ['ros', 'props'] and global_step % args.props_num_steps == 0:
+                obs = obs_buffer[:global_step]
+                actions = actions_buffer[:global_step]
+                with torch.no_grad():
+                    logprobs = agent.get_logprob(obs, actions)
+
+                b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
+                b_actions = actions.reshape((-1,) + envs.single_action_space.shape).long()
+                b_logprobs = logprobs.reshape(-1)
+
                 props_update(agent_props, optimizer_props, b_obs, b_actions, b_logprobs, args)
             ################################## END BEHAVIOR UPDATE ##################################
 
-        if global_step < args.buffer_size:
-            obs = obs_buffer[:global_step]
-            actions = actions_buffer[:global_step]
-            rewards = rewards_buffer[:global_step]
-            dones = dones_buffer[:global_step]
-        else:
-            obs = obs_buffer
-            actions = actions_buffer
-            rewards = rewards_buffer
-            dones = dones_buffer
-
-        # elif args.buffer_size > 1:
-        #     b_obs = torch.roll(b_obs, buffer_pos)
-        #     b_actions = torch.roll(b_actions, buffer_pos)
+        obs = obs_buffer[:global_step]
+        actions = actions_buffer[:global_step]
+        rewards = rewards_buffer[:global_step]
+        dones = dones_buffer[:global_step]
 
         with torch.no_grad():
             values = agent.get_value(obs).reshape(-1, args.num_envs)
             logprobs = agent.get_logprob(obs, actions).reshape(-1, args.num_envs)
-
-        # elif args.buffer_size > 1:
-        #     b_obs = torch.roll(b_obs, buffer_pos)
-        #     b_actions = torch.roll(b_actions, buffer_pos)
 
         # bootstrap value if not done
         # @TODO: make sure this runs over the most recent batch
@@ -704,8 +697,8 @@ def run():
         ### Target policy (and value network) update
         # flatten buffer data
         b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
-        b_logprobs = logprobs.reshape(-1)
         b_actions = actions.reshape((-1,) + envs.single_action_space.shape).long()
+        b_logprobs = logprobs.reshape(-1)
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
