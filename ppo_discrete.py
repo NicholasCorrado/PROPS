@@ -54,8 +54,8 @@ class Args:
     algo: str = 'ppo'
 
     # Sampling algorithm
-    # sampling_algo: str = 'props'
-    sampling_algo: str = 'on_policy'
+    sampling_algo: str = 'props'
+    # sampling_algo: str = 'on_policy'
 
     # Algorithm specific arguments
     env_id: str = "CartPole-v1"
@@ -77,13 +77,14 @@ class Args:
     buffer_batches: int = 2
 
     # Behavior
-    props_num_steps: int = 16
+    props_num_steps: int = 64
     props_learning_rate: float = 1e-3
     props_update_epochs: int = 4
     props_num_minibatches: int = 4
     props_clip_coef: float = 0.3
     props_target_kl: float = 0.03
     props_lambda: float = 0.1
+    props_freeze_features: bool = False
 
     # to be filled in runtime
     batch_size: int = 0
@@ -584,10 +585,12 @@ def run():
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     agent_props = copy.deepcopy(agent)
+
     # Freeze the feature layers of the empirical policy (as done in the Robust On-policy Sampling (ROS) paper)
-    # params = [p for p in agent_props.actor.parameters()]
-    # for p in params[:4]:
-    #     p.requires_grad = False
+    if args.props_freeze_features:
+        params = [p for p in agent_props.actor.parameters()]
+        for p in params[:4]:
+            p.requires_grad = False
 
     optimizer_props = optim.Adam(agent_props.parameters(), lr=args.props_learning_rate, eps=1e-5)
 
