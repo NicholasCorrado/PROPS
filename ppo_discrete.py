@@ -74,7 +74,7 @@ class Args:
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     target_kl: float = 0.03
-    buffer_size: int = 1
+    buffer_batches: int = 1
 
     # Behavior
     props_num_steps: int = 16
@@ -396,7 +396,7 @@ def compute_se(args, agent, agent_props, obs, actions, global_step, envs):
     b_obs = obs.reshape(-1, obs_dim).to('cpu')
     b_actions = actions.reshape(-1).to('cpu')
 
-    if global_step < args.buffer_size * args.num_steps:
+    if global_step < args.buffer_size:
         b_obs = b_obs[:global_step]
         b_actions = b_actions[:global_step]
 
@@ -454,7 +454,7 @@ def update_behavior_policy(args, global_step, envs, obs, logprobs, actions, agen
     b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
 
     # @TODO: fix when you add historic data
-    if global_step < args.buffer_size * args.num_steps:
+    if global_step < args.buffer_size:
         b_obs = b_obs[:global_step]
         b_logprobs = b_logprobs[:global_step]
         b_actions = b_actions[:global_step]
@@ -513,6 +513,8 @@ def run():
     args.props_batch_size = int(args.num_envs * args.props_num_steps)
     args.props_minibatch_size = int(args.props_batch_size // args.props_num_minibatches)
     props_iterations_per_target_update = args.num_steps // args.props_num_steps
+
+    args.buffer_size = args.buffer_batches * args.num_steps
 
     if args.sampling_algo in ['props', 'ros']:
         assert args.num_steps % args.props_num_steps == 0
@@ -596,12 +598,12 @@ def run():
     target_update_count = 0
 
     # ALGO Logic: Storage setup
-    obs_buffer = torch.zeros((args.buffer_size * args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
-    actions_buffer = torch.zeros((args.buffer_size * args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
-    # logprobs_buffer = torch.zeros((args.buffer_size * args.num_steps, args.num_envs)).to(device)
-    rewards_buffer = torch.zeros((args.buffer_size * args.num_steps, args.num_envs)).to(device)
-    dones_buffer = torch.zeros((args.buffer_size * args.num_steps, args.num_envs)).to(device)
-    # values = torch.zeros((args.buffer_size * args.num_steps, args.num_envs)).to(device)
+    obs_buffer = torch.zeros((args.buffer_size, args.num_envs) + envs.single_observation_space.shape).to(device)
+    actions_buffer = torch.zeros((args.buffer_size, args.num_envs) + envs.single_action_space.shape).to(device)
+    # logprobs_buffer = torch.zeros((args.buffer_size, args.num_envs)).to(device)
+    rewards_buffer = torch.zeros((args.buffer_size, args.num_envs)).to(device)
+    dones_buffer = torch.zeros((args.buffer_size, args.num_envs)).to(device)
+    # values = torch.zeros((args.buffer_size, args.num_envs)).to(device)
     agent_buffer = deque(maxlen=args.buffer_size)
     envs_buffer = deque(maxlen=args.buffer_size)
 
@@ -644,7 +646,7 @@ def run():
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
 
             buffer_pos += 1
-            buffer_pos %= args.buffer_size * args.num_steps
+            buffer_pos %= args.buffer_size
             # buffer_pos = np.clip(buffer_pos, a_min=0, a_max=args.num_steps-1)
 
 
@@ -653,7 +655,7 @@ def run():
                 props_update(agent_props, optimizer_props, b_obs, b_actions, b_logprobs, args)
             ################################## END BEHAVIOR UPDATE ##################################
 
-        # if global_step < args.buffer_size * args.num_steps:
+        # if global_step < args.buffer_size:
         obs = obs_buffer[:global_step]
         actions = actions_buffer[:global_step]
         rewards = rewards_buffer[:global_step]
