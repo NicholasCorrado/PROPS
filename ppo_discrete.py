@@ -45,7 +45,7 @@ class Args:
     # Evaluation
     eval_freq: int = 1
     eval_episodes: int = 0
-    compute_sampling_error: bool = True
+    compute_sampling_error: bool = False
 
     # Architecture arguments
     linear: int = 0
@@ -395,7 +395,10 @@ def compute_se(agent, b_obs, b_actions, envs):
     # Freeze the feature layers of the empirical policy (as done in the Robust On-policy Sampling (ROS) paper)
     # params = [p for p in agent_mle.actor.parameters()]
     # params[0].requires_grad = False
+    # params[1].requires_grad = False
     # params[2].requires_grad = False
+    # params[3].requires_grad = False
+
     num_epochs = 5000
     optimizer_mle = optim.Adam(agent_mle.parameters(), lr=1e-3)
     lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer_mle, T_max=num_epochs,)
