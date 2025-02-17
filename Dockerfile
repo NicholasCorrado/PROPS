@@ -8,6 +8,8 @@ COPY requirements.txt .
 RUN apt-get update && apt-get install -y swig build-essential
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . /workspace
+#COPY custom-envs /workspace/custom-envs
+#RUN pip install -e custom-envs
 
 # Install known base requirements
 #RUN pip install torch --index-url https://download.pytorch.org/whl/cpu

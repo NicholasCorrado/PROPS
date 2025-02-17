@@ -17,7 +17,8 @@ rm ${CODENAME}.tar.gz
 #pip install -r requirements.txt
 
 cd PROPS
-pip install -e custom-envs
+export PYTHONPATH=custom-envs:$PYTHONPATH # pip install -e fails on chtc because we don't have admin privileges .
+#pip install --user -e custom-envs
 
 # run your script -- $step ensures seeding is consistent across experiment batches
 $($cmd --run_id $step --seed $step)
