@@ -1,14 +1,14 @@
 import os
 
-buffer_batches = 8
-num_steps = 256
+buffer_batches = 16
+num_steps = 64
 total_timesteps = buffer_batches*num_steps
 for env_id in [
     'CartPole-v1',
     # 'LunarLander-v3',
     # 'Discrete2D100-v0'
 ]:
-    # for i in range(5):
+    # for i in range(3):
     #     os.system(
     #         f"python ../ppo_discrete.py --run_id {i} --seed {i}"
     #         f" --env_id {env_id}"

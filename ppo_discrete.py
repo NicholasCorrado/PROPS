@@ -77,12 +77,12 @@ class Args:
     buffer_batches: int = 16
 
     # Behavior
-    props_num_steps: int = 16
-    props_learning_rate: float = 1e-4
+    props_num_steps: int = 8
+    props_learning_rate: float = 1e-3
     props_update_epochs: int = 16
     props_num_minibatches: int = 4
     props_clip_coef: float = 0.3
-    props_target_kl: float = 0.01
+    props_target_kl: float = 0.1
     props_lambda: float = 0.0
     props_freeze_features: bool = False
 
@@ -90,73 +90,6 @@ class Args:
     batch_size: int = 0
     minibatch_size: int = 0
     num_iterations: int = 0
-
-#
-# @dataclass
-# class Args:
-#     exp_name: str = os.path.basename(__file__)[: -len(".py")]
-#     torch_deterministic: bool = True
-#     cuda: bool = True
-#     track: bool = False
-#     wandb_project_name: str = "cleanRL"
-#     wandb_entity: str = None
-#     capture_video: bool = False
-#
-#     # Logging
-#     output_rootdir: str = 'results'
-#     output_subdir: str = ''
-#     run_id: int = None
-#     seed: int = 0
-#     total_timesteps: int = 300000
-#
-#     # Evaluation
-#     eval_freq: int = 10
-#     eval_episodes: int = 20
-#     compute_sampling_error: bool = False
-#
-#     # Architecture arguments
-#     linear: int = 0
-#
-#     # Learning algorithm
-#     algo: str = 'ppo'
-#
-#     # Sampling algorithm
-#     # sampling_algo: str = 'props'
-#     sampling_algo: str = 'on_policy'
-#
-#     # Algorithm specific arguments
-#     env_id: str = "CartPole-v1"
-#     learning_rate: float = 1e-3
-#     num_envs: int = 1
-#     num_steps: int = 256
-#     anneal_lr: bool = False
-#     gamma: float = 0.99
-#     gae_lambda: float = 0.95
-#     num_minibatches: int = 4
-#     update_epochs: int = 4
-#     norm_adv: bool = True
-#     clip_coef: float = 0.2
-#     clip_vloss: bool = True
-#     ent_coef: float = 0.01
-#     vf_coef: float = 0.5
-#     max_grad_norm: float = 0.5
-#     target_kl: float = 0.03
-#     buffer_batches: int = 1
-#
-#     # Behavior
-#     props_num_steps: int = 64
-#     props_learning_rate: float = 1e-3
-#     props_update_epochs: int = 4
-#     props_num_minibatches: int = 4
-#     props_clip_coef: float = 0.3
-#     props_target_kl: float = 0.03
-#     props_lambda: float = 0.1
-#     props_freeze_features: bool = False
-#
-#     # to be filled in runtime
-#     batch_size: int = 0
-#     minibatch_size: int = 0
-#     num_iterations: int = 0
 
 
 def make_env(env_id, idx, capture_video, run_name):
@@ -415,7 +348,7 @@ def props_update(
                 approx_kl = ((ratio - 1) - logratio).mean()
                 clipfracs += [((ratio - 1.0).abs() > args.props_clip_coef).float().mean().item()]
 
-            kl_regularizer_loss = (torch.exp(b_logprobs[mb_inds])*(newlogprob - b_logprobs[mb_inds])).mean()
+            # kl_regularizer_loss = (torch.exp(b_logprobs[mb_inds])*(newlogprob - b_logprobs[mb_inds])).mean()
 
 
             # Policy loss
@@ -423,7 +356,7 @@ def props_update(
             pg_loss2 = torch.clamp(ratio, 1 - args.props_clip_coef, 1 + args.props_clip_coef)
             pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-            loss = pg_loss - args.props_lambda * kl_regularizer_loss
+            loss = pg_loss #- args.props_lambda * kl_regularizer_loss
 
             optimizer.zero_grad()
             loss.backward()
@@ -463,9 +396,9 @@ def compute_se(agent, b_obs, b_actions, envs):
     # params = [p for p in agent_mle.actor.parameters()]
     # params[0].requires_grad = False
     # params[2].requires_grad = False
-
+    num_epochs = 5000
     optimizer_mle = optim.Adam(agent_mle.parameters(), lr=1e-3)
-
+    lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer_mle, T_max=num_epochs,)
     n = len(b_obs)
     b_inds = np.arange(n)
 
@@ -485,11 +418,15 @@ def compute_se(agent, b_obs, b_actions, envs):
             loss.backward()
             grad_norm = nn.utils.clip_grad_norm_(agent_mle.parameters(), 1, norm_type=2)
             optimizer_mle.step()
+        lr_scheduler.step()
+        # print(lr_scheduler.optimizer.param_groups[0]["lr"])
         # print(grad_norm)
         # if loss < 0.01: break
-        if epoch % 500 == 0:
+        # print()
+        # if epoch % 1000 == 0:
+        if epoch % num_epochs == 0:
             print(loss, grad_norm, entropy_mle.mean())
-        if epoch % 5000 == 0: break
+            break
 
 
     with torch.no_grad():
