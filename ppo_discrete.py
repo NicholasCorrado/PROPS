@@ -40,10 +40,11 @@ class Args:
     output_subdir: str = ''
     run_id: int = None
     seed: int = None
-    total_timesteps: int = 32*256
+    total_timesteps: int = 500000
 
     # Evaluation
-    eval_freq: int = 1
+    num_evals: int = 40
+    eval_freq: int = 10
     eval_episodes: int = 0
     compute_sampling_error: bool = False
 
@@ -61,12 +62,12 @@ class Args:
     env_id: str = "CartPole-v1"
     learning_rate: float = 0
     num_envs: int = 1
-    num_steps: int = 256
+    num_steps: int = 1024
     anneal_lr: bool = False
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    num_minibatches: int = 4
-    update_epochs: int = 4
+    num_minibatches: int = 16
+    update_epochs: int = 16
     norm_adv: bool = True
     clip_coef: float = 0.2
     clip_vloss: bool = True
@@ -74,7 +75,7 @@ class Args:
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     target_kl: float = 0.03
-    buffer_batches: int = 16
+    buffer_batches: int = 1
 
     # Behavior
     props_num_steps: int = 8
@@ -451,6 +452,7 @@ def run():
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
+    args.eval_freq = max(args.num_iterations // args.num_evals, 1)
 
     args.props_batch_size = int(args.num_envs * args.props_num_steps)
     args.props_minibatch_size = int(args.props_batch_size // args.props_num_minibatches)
@@ -568,15 +570,10 @@ def run():
         # envs_history.append(copy.deepcopy(envs))
 
         # shift buffers left by one batch. We will place the next batch we collect at the end of the buffer.
-        obs_buffer = torch.roll(obs_buffer, shifts=-args.num_steps, dims=0)
-        actions_buffer = torch.roll(actions_buffer, shifts=-args.num_steps, dims=0)
-        rewards_buffer = torch.roll(rewards_buffer, shifts=-args.num_steps, dims=0)
-        dones_buffer = torch.roll(dones_buffer, shifts=-args.num_steps, dims=0)
-
-        # obs_buffer[:-args.num_steps,:, :] = obs_buffer[args.num_steps:, :, :]
-        # actions_buffer[:-args.num_steps] = actions_buffer[args.num_steps:]
-        # rewards_buffer[:-args.num_steps] = rewards_buffer[args.num_steps:]
-        # dones_buffer[:-args.num_steps] = dones_buffer[args.num_steps:]
+        # obs_buffer = torch.roll(obs_buffer, shifts=-args.num_steps, dims=0)
+        # actions_buffer = torch.roll(actions_buffer, shifts=-args.num_steps, dims=0)
+        # rewards_buffer = torch.roll(rewards_buffer, shifts=-args.num_steps, dims=0)
+        # dones_buffer = torch.roll(dones_buffer, shifts=-args.num_steps, dims=0)
 
         for step in range(0, args.num_steps):
             global_step += args.num_envs
