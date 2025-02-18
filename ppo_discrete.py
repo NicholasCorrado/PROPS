@@ -34,6 +34,10 @@ class Args:
     wandb_project_name: str = "cleanRL"
     wandb_entity: str = None
     capture_video: bool = False
+    save_policy: bool = False
+    load_policy_path: str = ''
+    # collect_before_training: int = None
+    # collect_policy_path: str = ''
 
     # Logging
     output_rootdir: str = 'results'
@@ -81,7 +85,7 @@ class Args:
     props_num_steps: int = 8
     props_learning_rate: float = 1e-3
     props_update_epochs: int = 16
-    props_num_minibatches: int = 4
+    props_num_minibatches: int = 16
     props_clip_coef: float = 0.3
     props_target_kl: float = 0.1
     props_lambda: float = 0.0
@@ -314,19 +318,12 @@ def props_update(
         b_obs (torch.Tensor): Batch of observations/states from the environment
         b_actions (torch.Tensor): Batch of actions taken in the environment
         b_logprobs (torch.Tensor): Log probabilities of the actions taken under the old policy
-        b_advantages (torch.Tensor): Computed advantage estimates for each timestep
-        b_returns (torch.Tensor): Computed returns (discounted sum of rewards)
-        b_values (torch.Tensor): Value estimates from the old policy
         args: Object containing PROPS hyperparameters including:
-            - num_minibatches (int): Number of minibatches to split the data into
-            - update_epochs (int): Number of epochs to update on the same batch of data
-            - clip_coef (float): PROPS clipping coefficient (epsilon in the paper)
-            - norm_adv (bool): Whether to normalize advantages
-            - clip_vloss (bool): Whether to use clipped value loss
-            - ent_coef (float): Entropy bonus coefficient
-            - vf_coef (float): Value function loss coefficient
+            - props_num_minibatches (int): Number of minibatches to split the data into
+            - props_update_epochs (int): Number of epochs to update on the same batch of data
+            - props_clip_coef (float): PROPS clipping coefficient (epsilon in the paper)
             - max_grad_norm (float): Maximum gradient norm for clipping
-            - target_kl (float, optional): Target KL divergence threshold for early stopping
+            - props_target_kl (float, optional): Target KL divergence threshold for early stopping
     """
     ### Target policy (and value network) update
     batch_size = len(b_obs)
@@ -349,15 +346,13 @@ def props_update(
                 approx_kl = ((ratio - 1) - logratio).mean()
                 clipfracs += [((ratio - 1.0).abs() > args.props_clip_coef).float().mean().item()]
 
-            # kl_regularizer_loss = (torch.exp(b_logprobs[mb_inds])*(newlogprob - b_logprobs[mb_inds])).mean()
-
-
             # Policy loss
             pg_loss1 = ratio
             pg_loss2 = torch.clamp(ratio, 1 - args.props_clip_coef, 1 + args.props_clip_coef)
             pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-            loss = pg_loss #- args.props_lambda * kl_regularizer_loss
+            kl_regularizer_loss = (torch.exp(b_logprobs[mb_inds])*(newlogprob - b_logprobs[mb_inds])).mean()
+            loss = pg_loss - args.props_lambda * kl_regularizer_loss
 
             optimizer.zero_grad()
             loss.backward()
@@ -367,22 +362,60 @@ def props_update(
         if args.props_target_kl is not None and approx_kl > args.props_target_kl:
             break
 
-    # y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
-    # var_y = np.var(y_true)
-    # explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
+    logs = {
+        'policy_loss': pg_loss.item(),
+        # 'entropy': entropy.item(),
+        'approx_kl': approx_kl.item(),
+        'clipfrac': np.mean(clipfracs),
+        'epoch': epoch
+    }
+    return logs
 
-    # TRY NOT TO MODIFY: record rewards for plotting purposes
-    # writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
-    # writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
-    # writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
-    # writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
-    # writer.add_scalar("losses/old_approx_kl", old_approx_kl.item(), global_step)
-    # writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
-    # writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
-    # writer.add_scalar("losses/explained_variance", explained_var, global_step)
-    # writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+def ros_update(
+        agent,  # Policy network (actor-critic architecture)
+        optimizer,  # Optimizer (typically Adam)
+        b_obs,  # Batch of observations (states)
+        b_actions,  # Batch of actions taken
+        b_logprobs,  # Batch of log probabilities of taken actions
+        args,  # Arguments containing hyperparameters
+):
+    """
+    Performs a ROS policy update step
 
-    ################################## END TARGET UPDATE ##################################
+    Args:
+        agent: The actor-critic policy network that is being updated
+        optimizer: The optimizer (typically Adam) used for updating the policy
+        b_obs (torch.Tensor): Batch of observations/states from the environment
+        b_actions (torch.Tensor): Batch of actions taken in the environment
+        b_logprobs (torch.Tensor): Log probabilities of the actions taken under the old policy
+        args: Object containing PROPS hyperparameters including:
+            - max_grad_norm (float): Maximum gradient norm for clipping
+    """
+    ### Target policy (and value network) update
+    _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs, b_actions.long())
+    logratio = newlogprob - b_logprobs
+    ratio = logratio.exp()
+
+    with torch.no_grad():
+        # calculate approx_kl http://joschu.net/blog/kl-approx.html
+        # old_approx_kl = (-logratio).mean()
+        approx_kl = ((ratio - 1) - logratio).mean()
+
+    # Policy loss
+    loss = ratio.mean()
+
+    optimizer.zero_grad()
+    loss.backward()
+    nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+    optimizer.step()
+
+    logs = {
+        'policy_loss': loss.item(),
+        # 'entropy': entropy.item(),
+        'approx_kl': approx_kl.item(),
+    }
+    return logs
+
 
 def compute_se(agent, b_obs, b_actions, envs):
     # COMPUTE SAMPLING ERROR
@@ -394,58 +427,53 @@ def compute_se(agent, b_obs, b_actions, envs):
     # print(params)
 
     # Freeze the feature layers of the empirical policy (as done in the Robust On-policy Sampling (ROS) paper)
-    # params = [p for p in agent_mle.actor.parameters()]
-    # params[0].requires_grad = False
-    # params[1].requires_grad = False
-    # params[2].requires_grad = False
-    # params[3].requires_grad = False
+    params = [p for p in agent_mle.actor.parameters()]
+    params[0].requires_grad = False
+    params[1].requires_grad = False
+    params[2].requires_grad = False
+    params[3].requires_grad = False
 
-    num_epochs = 5000
+    num_epochs = 2000
     optimizer_mle = optim.Adam(agent_mle.parameters(), lr=1e-3)
-    lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer_mle, T_max=num_epochs,)
+    lr_scheduler = optim.lr_scheduler.LinearLR(optimizer_mle, total_iters=num_epochs)
     n = len(b_obs)
-    b_inds = np.arange(n)
 
-    mb_size = 256 * n//256
-    epoch = 0
-    while True:
+    for epoch in range(num_epochs):
         epoch += 1
-        np.random.shuffle(b_inds)
-        for start in range(0, n, mb_size):
-            end = start + mb_size
-            mb_inds = b_inds[start:end]
+        _, logprobs_mle, entropy_mle = agent_mle.get_action_and_info(b_obs, b_actions)
+        loss = -torch.mean(logprobs_mle)# - 1*torch.mean(entropy_mle)
 
-            _, logprobs_mle, entropy_mle = agent_mle.get_action_and_info(b_obs[mb_inds], b_actions[mb_inds])
-            loss = -torch.mean(logprobs_mle)# - 1*torch.mean(entropy_mle)
-
-            optimizer_mle.zero_grad()
-            loss.backward()
-            grad_norm = nn.utils.clip_grad_norm_(agent_mle.parameters(), 1, norm_type=2)
-            optimizer_mle.step()
+        optimizer_mle.zero_grad()
+        loss.backward()
+        # grad_norm = nn.utils.clip_grad_norm_(agent_mle.parameters(), 1, norm_type=2)
+        optimizer_mle.step()
         lr_scheduler.step()
-        # print(lr_scheduler.optimizer.param_groups[0]["lr"])
-        # print(grad_norm)
-        # if loss < 0.01: break
-        # print()
-        # if epoch % 1000 == 0:
-        if epoch % num_epochs == 0:
-            print(loss, grad_norm, entropy_mle.mean())
-            break
 
 
     with torch.no_grad():
         _, logprobs_mle, _ = agent_mle.get_action_and_info(b_obs, b_actions)
         _, logprobs_target, ent_target = agent.get_action_and_info(b_obs, b_actions)
-
         # Compute sampling error
         approx_kl_mle_target = (logprobs_mle - logprobs_target).mean()
 
-        # logs = {}
-        # logs[f'kl_mle_target'].append(approx_kl_mle_target.item())
-        # logs[f'kl_props_target'].append(approx_kl_props_target.item())
-        # logs[f'ent_target'].append(ent_target.mean().item())
-        # logs[f'ent_props'].append(ent_props.mean().item())
     return approx_kl_mle_target.item()
+
+def fill_buffers(agent, envs, obs_buffer, actions_buffer, n_collect, device,):
+    buffer_pos = 0
+    next_obs, _ = envs.reset()
+    next_obs = torch.Tensor(next_obs).to(device)
+    for step in range(0, n_collect):
+        obs_buffer[buffer_pos] = next_obs
+        with torch.no_grad():
+            action = agent.get_action(next_obs)
+        actions_buffer[buffer_pos] = action
+        next_obs, _, _ , _, _ = envs.step(action.cpu().numpy())
+        next_obs = torch.Tensor(next_obs).to(device)
+        buffer_pos += 1
+    # return obs_buffer, actions_buffer
+
+# def collect(agent, envs, obs_buffer, actions_buffer, rewards_buffer, dones_buffer):
+
 
 def run():
     args = tyro.cli(Args)
@@ -473,10 +501,6 @@ def run():
     assert args.sampling_algo in ['on_policy', 'ros', 'props', 'greedy_adaptive', 'oracle_adaptive']
     if args.algo == 'ros':
         args.props_num_steps = 1
-        args.props_update_epochs = 1
-        args.props_clip_coef = 9999999
-        args.props_target_kl = 9999999
-        args.props_lambda = 0
 
     ### Output path
     args.output_dir = f"{args.output_rootdir}/{args.env_id}/{args.algo}/{args.sampling_algo}/{args.output_subdir}"
@@ -519,12 +543,18 @@ def run():
         [make_env(args.env_id, i, args.capture_video, run_name) for i in range(args.num_envs)],
     )
     env_eval = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, i, args.capture_video, run_name) for i in range(args.num_envs)],
+        [make_env(args.env_id, i, args.capture_video, run_name) for i in range(1)],
     ).envs[0]
+    envs_se = gym.vector.SyncVectorEnv(
+        [make_env(args.env_id, i, args.capture_video, run_name) for i in range(1)],
+    )
 
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
     agent = Agent(envs, args.linear).to(device)
+    if args.load_policy_path:
+        agent = torch.load(args.load_policy_path, weights_only=False)
+
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     agent_props = copy.deepcopy(agent)
@@ -548,8 +578,22 @@ def run():
     actions_buffer = torch.zeros((args.buffer_size, args.num_envs) + envs.single_action_space.shape).to(device)
     rewards_buffer = torch.zeros((args.buffer_size, args.num_envs)).to(device)
     dones_buffer = torch.zeros((args.buffer_size, args.num_envs)).to(device)
+
+    # buffer_pos = 0
+    # global_step = 0
+    # if args.collect_before_training:
+    #     # collect(obs_buffer, actions_buffer, rewards_buffer, dones_buffer)
+    #     # agent_collect = torch.load(args.collect_policy_path, weights_only=False)
+    #     agent_collect = Agent(envs, args.linear).to(device)
+    #     fill_buffers(agent_collect, envs, obs_buffer, actions_buffer, args.collect_before_training, device)
+    #     buffer_pos = args.collect_before_training
+    #     global_step = args.collect_before_training
+
+    # for computing sampling error during RL
     agent_buffer = deque(maxlen=args.buffer_size)
     envs_buffer = deque(maxlen=args.buffer_size)
+    obs_buffer_se = torch.zeros((args.buffer_size, args.num_envs) + envs.single_observation_space.shape).to(device)
+    actions_buffer_se = torch.zeros((args.buffer_size, args.num_envs) + envs.single_action_space.shape).to(device)
 
     # TRY NOT TO MODIFY: start the game
     global_step = 0
@@ -569,11 +613,12 @@ def run():
         # agent_history.append(copy.deepcopy(agent))
         # envs_history.append(copy.deepcopy(envs))
 
-        # shift buffers left by one batch. We will place the next batch we collect at the end of the buffer.
-        # obs_buffer = torch.roll(obs_buffer, shifts=-args.num_steps, dims=0)
-        # actions_buffer = torch.roll(actions_buffer, shifts=-args.num_steps, dims=0)
-        # rewards_buffer = torch.roll(rewards_buffer, shifts=-args.num_steps, dims=0)
-        # dones_buffer = torch.roll(dones_buffer, shifts=-args.num_steps, dims=0)
+        if global_step >= args.buffer_size:
+            # shift buffers left by one batch. We will place the next batch we collect at the end of the buffer.
+            obs_buffer = torch.roll(obs_buffer, shifts=-args.num_steps, dims=0)
+            actions_buffer = torch.roll(actions_buffer, shifts=-args.num_steps, dims=0)
+            rewards_buffer = torch.roll(rewards_buffer, shifts=-args.num_steps, dims=0)
+            dones_buffer = torch.roll(dones_buffer, shifts=-args.num_steps, dims=0)
 
         for step in range(0, args.num_steps):
             global_step += args.num_envs
@@ -601,7 +646,8 @@ def run():
                 buffer_pos = args.buffer_size - args.num_steps
 
             ################################## START BEHAVIOR UPDATE ##################################
-            if args.sampling_algo in ['ros', 'props'] and global_step % args.props_num_steps == 0:
+            log_props = {}
+            if args.sampling_algo in ['props', 'ros'] and global_step % args.props_num_steps == 0:
                 obs = obs_buffer[:global_step]
                 actions = actions_buffer[:global_step]
                 with torch.no_grad():
@@ -611,7 +657,14 @@ def run():
                 b_actions = actions.reshape((-1,) + envs.single_action_space.shape).long()
                 b_logprobs = logprobs.reshape(-1)
 
-                props_update(agent_props, optimizer_props, b_obs, b_actions, b_logprobs, args)
+                for source_param, dump_param in zip(agent_props.parameters(), agent.parameters()):
+                    source_param.data.copy_(dump_param.data)
+
+                if args.sampling_algo == 'props':
+                    log_props = props_update(agent_props, optimizer_props, b_obs, b_actions, b_logprobs, args)
+                elif args.sampling_algo == 'ros':
+                    log_props = ros_update(agent_props, optimizer_props, b_obs, b_actions, b_logprobs, args)
+
             ################################## END BEHAVIOR UPDATE ##################################
 
         obs = obs_buffer[:global_step]
@@ -649,12 +702,8 @@ def run():
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
 
-        if args.compute_sampling_error:
-            # b_actions = b_actions.reshape(-1)
-            kl_mle_target = compute_se(agent, b_obs, b_actions, envs)
-            logs['sampling_error'].append(kl_mle_target)
-            print(logs['sampling_error'])
-            # print(agent.actor)
+        # @TODO compute sampling error before target policy update during RL experiments
+
 
         target_update_count += 1
         ppo_update(agent, optimizer, b_obs, b_actions, b_logprobs, b_advantages, b_returns, b_values, args)
@@ -667,16 +716,34 @@ def run():
                 f"Eval num_timesteps={global_step}, " f"episode_success={success_avg:.2f} +/- {success_std:.2f}\n"
             )
 
+            if iteration % args.eval_freq == 0 and args.compute_sampling_error:
+                if args.compute_sampling_error:
+                    # b_actions = b_actions.reshape(-1)
+                    kl_mle_target = compute_se(agent, b_obs, b_actions, envs)
+                    logs['sampling_error'].append(kl_mle_target)
+                    print(logs['sampling_error'])
+
+                    # fill_buffers(agent, envs_se, obs_buffer_se, actions_buffer_se, args, device)
+                    # b_obs_se = obs_buffer_se.reshape((-1,) + envs.single_observation_space.shape)
+                    # b_actions_se = actions_buffer_se.reshape((-1,) + envs.single_action_space.shape).long()
+                    # kl_mle_target = compute_se(agent, b_obs_se, b_actions_se, envs)
+                    # logs['sampling_error_target'].append(kl_mle_target)
+                    # print(logs['sampling_error_target'])
+
             logs['timestep'].append(global_step)
             logs['return'].append(return_avg)
             logs['success_rate'].append(success_avg)
             logs['target_update'].append(target_update_count)
+            for key, value in log_props.items():
+                logs[f'props_{key}'].append(value)
 
             np.savez(
                 f'{args.output_dir}/evaluations.npz',
                 **logs,
                 **logs_sampling_error
             )
+            if args.save_policy:
+                torch.save(agent, f"{args.output_dir}/policy.pt")
 
     envs.close()
     # writer.close()
