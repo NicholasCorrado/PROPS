@@ -49,7 +49,7 @@ class Args:
     # Evaluation
     num_evals: int = 40
     eval_freq: int = 10
-    eval_episodes: int = 0
+    eval_episodes: int = 20
     compute_sampling_error: bool = False
 
     # Architecture arguments
@@ -64,7 +64,7 @@ class Args:
 
     # Algorithm specific arguments
     env_id: str = "CartPole-v1"
-    learning_rate: float = 0
+    learning_rate: float = 1e-3
     num_envs: int = 1
     num_steps: int = 1024
     anneal_lr: bool = False
@@ -82,12 +82,12 @@ class Args:
     buffer_batches: int = 1
 
     # Behavior
-    props_num_steps: int = 8
-    props_learning_rate: float = 1e-3
+    props_num_steps: int = 64
+    props_learning_rate: float = 1e-4
     props_update_epochs: int = 16
     props_num_minibatches: int = 16
     props_clip_coef: float = 0.3
-    props_target_kl: float = 0.1
+    props_target_kl: float = 0.03
     props_lambda: float = 0.0
     props_freeze_features: bool = False
 
@@ -458,18 +458,20 @@ def compute_se(agent, b_obs, b_actions, envs):
 
     return approx_kl_mle_target.item()
 
-def fill_buffers(agent, envs, obs_buffer, actions_buffer, n_collect, device,):
+def fill_buffers(agent_buffer, envs, obs_buffer, actions_buffer, n_collect, device):
     buffer_pos = 0
     next_obs, _ = envs.reset()
     next_obs = torch.Tensor(next_obs).to(device)
-    for step in range(0, n_collect):
-        obs_buffer[buffer_pos] = next_obs
-        with torch.no_grad():
-            action = agent.get_action(next_obs)
-        actions_buffer[buffer_pos] = action
-        next_obs, _, _ , _, _ = envs.step(action.cpu().numpy())
-        next_obs = torch.Tensor(next_obs).to(device)
-        buffer_pos += 1
+
+    for agent in agent_buffer:
+        for step in range(0, n_collect):
+            obs_buffer[buffer_pos] = next_obs
+            with torch.no_grad():
+                action = agent.get_action(next_obs)
+            actions_buffer[buffer_pos] = action
+            next_obs, _, _ , _, _ = envs.step(action.cpu().numpy())
+            next_obs = torch.Tensor(next_obs).to(device)
+            buffer_pos += 1
     # return obs_buffer, actions_buffer
 
 # def collect(agent, envs, obs_buffer, actions_buffer, rewards_buffer, dones_buffer):
@@ -590,8 +592,8 @@ def run():
     #     global_step = args.collect_before_training
 
     # for computing sampling error during RL
-    agent_buffer = deque(maxlen=args.buffer_size)
-    envs_buffer = deque(maxlen=args.buffer_size)
+    agent_buffer = deque(maxlen=args.buffer_batches)
+    envs_buffer = deque(maxlen=args.buffer_batches)
     obs_buffer_se = torch.zeros((args.buffer_size, args.num_envs) + envs.single_observation_space.shape).to(device)
     actions_buffer_se = torch.zeros((args.buffer_size, args.num_envs) + envs.single_action_space.shape).to(device)
 
@@ -610,8 +612,10 @@ def run():
             lrnow = frac * args.learning_rate
             optimizer.param_groups[0]["lr"] = lrnow
 
-        # agent_history.append(copy.deepcopy(agent))
-        # envs_history.append(copy.deepcopy(envs))
+        # if iteration % args.eval_freq == 0 and args.compute_sampling_error:
+            # agent_buffer.appendleft(copy.deepcopy(agent))
+            # envs_buffer.appendleft(copy.deepcopy(envs))
+        agent_buffer.append(copy.deepcopy(agent))
 
         if global_step >= args.buffer_size:
             # shift buffers left by one batch. We will place the next batch we collect at the end of the buffer.
@@ -703,7 +707,19 @@ def run():
         b_values = values.reshape(-1)
 
         # @TODO compute sampling error before target policy update during RL experiments
+        if iteration % args.eval_freq == 0 and args.compute_sampling_error:
+            # b_actions = b_actions.reshape(-1)
+            kl_mle_target = compute_se(agent, b_obs, b_actions, envs)
+            logs['sampling_error'].append(kl_mle_target)
+            print(logs['sampling_error'])
 
+
+            fill_buffers(agent_buffer, envs_se, obs_buffer_se, actions_buffer_se, args.num_steps, device)
+            b_obs_se = obs_buffer_se[:global_step].reshape((-1,) + envs.single_observation_space.shape)
+            b_actions_se = actions_buffer_se[:global_step].reshape((-1,) + envs.single_action_space.shape).long()
+            kl_mle_target = compute_se(agent, b_obs_se, b_actions_se, envs)
+            logs['sampling_error_target'].append(kl_mle_target)
+            print(logs['sampling_error_target'])
 
         target_update_count += 1
         ppo_update(agent, optimizer, b_obs, b_actions, b_logprobs, b_advantages, b_returns, b_values, args)
@@ -715,20 +731,6 @@ def run():
                 f"Eval num_timesteps={global_step}, " f"episode_return={return_avg:.2f} +/- {return_std:.2f}\n"
                 f"Eval num_timesteps={global_step}, " f"episode_success={success_avg:.2f} +/- {success_std:.2f}\n"
             )
-
-            if iteration % args.eval_freq == 0 and args.compute_sampling_error:
-                if args.compute_sampling_error:
-                    # b_actions = b_actions.reshape(-1)
-                    kl_mle_target = compute_se(agent, b_obs, b_actions, envs)
-                    logs['sampling_error'].append(kl_mle_target)
-                    print(logs['sampling_error'])
-
-                    # fill_buffers(agent, envs_se, obs_buffer_se, actions_buffer_se, args, device)
-                    # b_obs_se = obs_buffer_se.reshape((-1,) + envs.single_observation_space.shape)
-                    # b_actions_se = actions_buffer_se.reshape((-1,) + envs.single_action_space.shape).long()
-                    # kl_mle_target = compute_se(agent, b_obs_se, b_actions_se, envs)
-                    # logs['sampling_error_target'].append(kl_mle_target)
-                    # print(logs['sampling_error_target'])
 
             logs['timestep'].append(global_step)
             logs['return'].append(return_avg)
