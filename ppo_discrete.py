@@ -82,11 +82,11 @@ class Args:
     buffer_batches: int = 1
 
     # Behavior
-    props_num_steps: int = 64
-    props_learning_rate: float = 1e-4
+    props_num_steps: int = 32
+    props_learning_rate: float = 1e-2
     props_update_epochs: int = 16
     props_num_minibatches: int = 16
-    props_clip_coef: float = 0.3
+    props_clip_coef: float = 0.1
     props_target_kl: float = 0.03
     props_lambda: float = 0.0
     props_freeze_features: bool = False
@@ -284,6 +284,15 @@ def ppo_update(
         if args.target_kl is not None and approx_kl > args.target_kl:
             break
 
+    logs = {
+        'policy_loss': pg_loss.item(),
+        # 'props_entropy': entropy.item(),
+        'approx_kl': approx_kl.item(),
+        'clipfrac': np.mean(clipfracs),
+        'epoch': epoch
+    }
+    return logs
+
     # y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
     # var_y = np.var(y_true)
     # explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
@@ -363,11 +372,11 @@ def props_update(
             break
 
     logs = {
-        'policy_loss': pg_loss.item(),
-        # 'entropy': entropy.item(),
-        'approx_kl': approx_kl.item(),
-        'clipfrac': np.mean(clipfracs),
-        'epoch': epoch
+        'props_policy_loss': pg_loss.item(),
+        # 'props_entropy': entropy.item(),
+        'props_approx_kl': approx_kl.item(),
+        'props_clipfrac': np.mean(clipfracs),
+        'props_epoch': epoch
     }
     return logs
 
@@ -525,9 +534,9 @@ def run():
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
-            sync_tensorboard=True,
+            # sync_tensorboard=True,
             config=vars(args),
-            name=run_name,
+            name=args.output_dir,
             monitor_gym=True,
             save_code=True,
         )
@@ -569,12 +578,6 @@ def run():
 
     optimizer_props = optim.Adam(agent_props.parameters(), lr=args.props_learning_rate, eps=1e-5)
 
-    ### Logging
-    logs = defaultdict(list)
-    logs_sampling_error = defaultdict(list)
-
-    target_update_count = 0
-
     # ALGO Logic: Storage setup
     obs_buffer = torch.zeros((args.buffer_size, args.num_envs) + envs.single_observation_space.shape).to(device)
     actions_buffer = torch.zeros((args.buffer_size, args.num_envs) + envs.single_action_space.shape).to(device)
@@ -597,9 +600,13 @@ def run():
     obs_buffer_se = torch.zeros((args.buffer_size, args.num_envs) + envs.single_observation_space.shape).to(device)
     actions_buffer_se = torch.zeros((args.buffer_size, args.num_envs) + envs.single_action_space.shape).to(device)
 
+    ### Logging
+    logs = defaultdict(list)
+
     # TRY NOT TO MODIFY: start the game
     global_step = 0
     buffer_pos = 0
+    target_update_count = 0
     start_time = time.time()
     next_obs, _ = envs.reset(seed=args.seed)
     next_obs = torch.Tensor(next_obs).to(device)
@@ -722,7 +729,7 @@ def run():
             print(logs['sampling_error_target'])
 
         target_update_count += 1
-        ppo_update(agent, optimizer, b_obs, b_actions, b_logprobs, b_advantages, b_returns, b_values, args)
+        log_target = ppo_update(agent, optimizer, b_obs, b_actions, b_logprobs, b_advantages, b_returns, b_values, args)
         ################################## END TARGET UPDATE ##################################
 
         if iteration % args.eval_freq == 0:
@@ -737,13 +744,17 @@ def run():
             logs['success_rate'].append(success_avg)
             logs['target_update'].append(target_update_count)
             for key, value in log_props.items():
-                logs[f'props_{key}'].append(value)
+                logs[key].append(value)
+            for key, value in log_target.items():
+                logs[key].append(value)
 
-            np.savez(
-                f'{args.output_dir}/evaluations.npz',
-                **logs,
-                **logs_sampling_error
-            )
+            np.savez(f'{args.output_dir}/evaluations.npz', **logs)
+
+            if args.track:
+                for key, value in logs.items():
+                    wandb.log({key: value[-1]})
+
+
             if args.save_policy:
                 torch.save(agent, f"{args.output_dir}/policy.pt")
 
