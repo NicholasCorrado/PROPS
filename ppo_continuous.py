@@ -169,12 +169,64 @@ class Agent(nn.Module):
             action = action_mean
         return action
 
+    def get_action_and_info(self, x, action=None):
+        action_mean = self.actor_mean(x)
+        action_logstd = self.actor_logstd.expand_as(action_mean)
+        action_std = torch.exp(action_logstd)
+        probs = Normal(action_mean, action_std)
+        if action is None:
+            action = probs.sample()
+        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1)
+
     def get_logprob(self, x, action):
         action_mean = self.actor_mean(x)
         action_logstd = self.actor_logstd.expand_as(action_mean)
         action_std = torch.exp(action_logstd)
         probs = Normal(action_mean, action_std)
         return probs.log_prob(action)
+
+
+
+def compute_se(agent, b_obs, b_actions, envs):
+    # COMPUTE SAMPLING ERROR
+
+    # Initialize empirical policy equal to the current PPO policy.
+    agent_mle = copy.deepcopy(agent)
+    # agent_mle = Agent(envs, linear=False)
+    # params = [p for p in agent.actor.parameters()]
+    # print(params)
+
+    # Freeze the feature layers of the empirical policy (as done in the Robust On-policy Sampling (ROS) paper)
+    params = [p for p in agent_mle.actor_mean.parameters()]
+    params[0].requires_grad = False
+    params[1].requires_grad = False
+    params[2].requires_grad = False
+    params[3].requires_grad = False
+
+    num_epochs = 2000
+    optimizer_mle = optim.Adam(agent_mle.parameters(), lr=1e-3)
+    lr_scheduler = optim.lr_scheduler.LinearLR(optimizer_mle, total_iters=num_epochs)
+    n = len(b_obs)
+
+    for epoch in range(num_epochs):
+        epoch += 1
+        _, logprobs_mle, entropy_mle = agent_mle.get_action_and_info(b_obs, b_actions)
+        loss = -torch.mean(logprobs_mle)# - 1*torch.mean(entropy_mle)
+
+        optimizer_mle.zero_grad()
+        loss.backward()
+        # grad_norm = nn.utils.clip_grad_norm_(agent_mle.parameters(), 1, norm_type=2)
+        optimizer_mle.step()
+        lr_scheduler.step()
+
+
+    with torch.no_grad():
+        _, logprobs_mle, _ = agent_mle.get_action_and_info(b_obs, b_actions)
+        _, logprobs_target, ent_target = agent.get_action_and_info(b_obs, b_actions)
+        # Compute sampling error
+        approx_kl_mle_target = (logprobs_mle - logprobs_target).mean()
+
+    return approx_kl_mle_target.item()
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
@@ -228,18 +280,19 @@ if __name__ == "__main__":
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     # ALGO Logic: Storage setup
-    obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
-    actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
-    logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    values = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    obs_buffer = torch.zeros((args.buffer_size, args.num_envs) + envs.single_observation_space.shape).to(device)
+    actions_buffer = torch.zeros((args.buffer_size, args.num_envs) + envs.single_action_space.shape).to(device)
+    logprobs = torch.zeros((args.buffer_size, args.num_envs)).to(device)
+    rewards_buffer = torch.zeros((args.buffer_size, args.num_envs)).to(device)
+    dones_buffer = torch.zeros((args.buffer_size, args.num_envs)).to(device)
+    values = torch.zeros((args.buffer_size, args.num_envs)).to(device)
 
     # Logging
     logs = defaultdict(list)
 
     # TRY NOT TO MODIFY: start the game
     global_step = 0
+    buffer_pos = 0
     start_time = time.time()
     next_obs, _ = envs.reset(seed=args.seed)
     next_obs = torch.Tensor(next_obs).to(device)
@@ -254,37 +307,47 @@ if __name__ == "__main__":
 
         for step in range(0, args.num_steps):
             global_step += args.num_envs
-            obs[step] = next_obs
-            dones[step] = next_done
+            obs_buffer[buffer_pos]= next_obs
+            dones_buffer[buffer_pos]= next_done
 
             # ALGO LOGIC: action logic
             with torch.no_grad():
                 action, logprob, _, value = agent.get_action_and_value(next_obs)
-                values[step] = value.flatten()
-            actions[step] = action
-            logprobs[step] = logprob
+                values[buffer_pos]= value.flatten()
+            actions_buffer[buffer_pos]= action
+            logprobs[buffer_pos]= logprob
 
             # TRY NOT TO MODIFY: execute the game and log data.
             next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
             next_done = np.logical_or(terminations, truncations)
-            rewards[step] = torch.tensor(reward).to(device).view(-1)
+            rewards_buffer[buffer_pos] = torch.tensor(reward).to(device).view(-1)
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
+
+            # Once the buffer is full, we only write to last batch in the buffer for all subsequent collection phases.
+            buffer_pos += 1
+            if buffer_pos == args.buffer_size:
+                buffer_pos = args.buffer_size - args.num_steps
 
         # bootstrap value if not done
         with torch.no_grad():
             next_value = agent.get_value(next_obs).reshape(1, -1)
-            advantages = torch.zeros_like(rewards).to(device)
+            advantages = torch.zeros_like(rewards_buffer).to(device)
             lastgaelam = 0
             for t in reversed(range(args.num_steps)):
                 if t == args.num_steps - 1:
                     nextnonterminal = 1.0 - next_done
                     nextvalues = next_value
                 else:
-                    nextnonterminal = 1.0 - dones[t + 1]
+                    nextnonterminal = 1.0 - dones_buffer[t + 1]
                     nextvalues = values[t + 1]
-                delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
+                delta = rewards_buffer[t] + args.gamma * nextvalues * nextnonterminal - values[t]
                 advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
             returns = advantages + values
+
+        obs = obs_buffer[:global_step]
+        actions = actions_buffer[:global_step]
+        rewards = rewards_buffer[:global_step]
+        dones = dones_buffer[:global_step]
 
         # flatten the batch
         b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
@@ -293,6 +356,14 @@ if __name__ == "__main__":
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
+
+
+        if iteration % args.eval_freq == 0 and args.compute_sampling_error:
+            # b_actions = b_actions.reshape(-1)
+            print(len(b_obs))
+            kl_mle_target = compute_se(agent, b_obs, b_actions, envs)
+            logs['sampling_error'].append(kl_mle_target)
+            print(logs['sampling_error'])
 
         # Optimizing the policy and value network
         b_inds = np.arange(args.batch_size)
