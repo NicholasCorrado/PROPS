@@ -16,7 +16,7 @@ def simulate(env, actor, eval_episodes, eval_steps=np.inf):
 
             # ALGO LOGIC: put action logic here
             with torch.no_grad():
-                actions = actor.get_action(torch.Tensor(obs).to('cpu'))
+                actions = actor.get_action(torch.Tensor(obs).to('cpu'), sample=False)
                 actions = actions.cpu().numpy()
 
             # TRY NOT TO MODIFY: execute the game and log data.
@@ -47,7 +47,19 @@ def simulate(env, actor, eval_episodes, eval_steps=np.inf):
     return return_avg, return_std, success_avg, success_std
     # return np.array(eval_returns), np.array(eval_obs), np.array(eval_actions), np.array(eval_rewards)
 
-
+# def simulate_vec():
+#     obs, _ = envs.reset()
+#     episodic_returns = []
+#     while len(episodic_returns) < eval_episodes:
+#         actions, _, _, _ = agent.get_action_and_value(torch.Tensor(obs).to(device))
+#         next_obs, _, _, _, infos = envs.step(actions.cpu().numpy())
+#         if "final_info" in infos:
+#             for info in infos["final_info"]:
+#                 if "episode" not in info:
+#                     continue
+#                 print(f"eval_episode={len(episodic_returns)}, episodic_return={info['episode']['r']}")
+#                 episodic_returns += [info["episode"]["r"]]
+#         obs = next_obs
 
 def simulate_np(env, actor, eval_episodes, eval_steps=np.inf):
     logs = defaultdict(list)
