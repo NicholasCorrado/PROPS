@@ -40,7 +40,7 @@ class Args:
     total_timesteps: int = 1000000
 
     # Evaluation
-    num_evals: int = 40
+    num_evals: int = 20
     eval_freq: int = 10
     eval_episodes: int = 20
     compute_sampling_error: bool = False
