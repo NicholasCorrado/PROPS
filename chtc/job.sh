@@ -16,7 +16,7 @@ cd PROPS
 export PYTHONPATH=custom-envs:$PYTHONPATH # pip install -e fails on chtc because we don't have admin privileges .
 mkdir gymnasium_local
 python -m pip install 'gymnasium[mujoco]==0.29.1' --target gymnasium_local
-
+export PYTHONPATH=gymnasium_local:$PYTHONPATH
 $cmd
 
 # compress results. This file will be transferred to your submit node upon job completion.
