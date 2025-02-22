@@ -47,13 +47,14 @@ class Args:
     total_timesteps: int = 500000
 
     # Evaluation
-    num_evals: int = None
+    num_evals: int = 20
     eval_freq: int = 10
     eval_episodes: int = 20
     compute_sampling_error: bool = False
 
     # Architecture arguments
     linear: int = 0
+    actor_init_std: float = 0.01
 
     # Learning algorithm
     algo: str = 'ppo'
@@ -66,7 +67,7 @@ class Args:
     env_id: str = "CartPole-v1"
     learning_rate: float = 1e-3
     num_envs: int = 1
-    num_steps: int = 1024
+    num_steps: int = 2048
     anneal_lr: bool = False
     gamma: float = 0.99
     gae_lambda: float = 0.95
@@ -80,14 +81,13 @@ class Args:
     max_grad_norm: float = 0.5
     target_kl: float = 0.03
     buffer_batches: int = 1
-
     # Behavior
     props_num_steps: int = 16
     props_learning_rate: float = 1e-3
     props_update_epochs: int = 16
     props_num_minibatches: int = 4
     props_clip_coef: float = 0.3
-    props_target_kl: float = 0.03
+    props_target_kl: float = 0.01
     props_lambda: float = 0.0
     props_freeze_features: bool = False
 
@@ -117,7 +117,7 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 
 class Agent(nn.Module):
-    def __init__(self, envs, linear):
+    def __init__(self, envs, linear, actor_init_std=0.01):
         super().__init__()
         self.obs_dim = envs.single_observation_space.shape[0]
 
@@ -133,7 +133,7 @@ class Agent(nn.Module):
             nn.Tanh(),
             layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, envs.single_action_space.n), std=0.01),
+            layer_init(nn.Linear(64, envs.single_action_space.n), std=actor_init_std),
         )
 
         if linear:
@@ -163,7 +163,7 @@ class Agent(nn.Module):
             action = probs.sample()
         return action, probs.log_prob(action), probs.entropy()
 
-    def get_action(self, x):
+    def get_action(self, x, sample=True):
         logits = self.actor(x)
         probs = Categorical(logits=logits)
         action = probs.sample()
@@ -644,6 +644,7 @@ def run():
             # agent_buffer.appendleft(copy.deepcopy(agent))
             # envs_buffer.appendleft(copy.deepcopy(envs))
         agent_buffer.append(copy.deepcopy(agent))
+        envs_buffer.append(copy.deepcopy(envs))
 
         if global_step > args.buffer_size:
             # shift buffers left by one batch. We will place the next batch we collect at the end of the buffer.
@@ -660,8 +661,7 @@ def run():
             # ALGO LOGIC: action logic
             with torch.no_grad():
                 if args.sampling_algo in ['props', 'ros']:
-                    action, _, _, _ = agent_props.get_action_and_value(next_obs)
-                    _, logprob, _, value = agent.get_action_and_value(next_obs, action=action)
+                    action = agent_props.get_action(next_obs)
                 else:
                     action = agent.get_action(next_obs)
             actions_buffer[buffer_pos] = action
@@ -740,7 +740,6 @@ def run():
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
 
-        # @TODO compute sampling error before target policy update during RL experiments
         if iteration % args.eval_freq == 0 and args.compute_sampling_error:
             # b_actions = b_actions.reshape(-1)
             print(len(b_obs))
@@ -749,14 +748,14 @@ def run():
             print(logs['sampling_error'])
 
             if args.learning_rate > 0 and args.update_epochs > 0:
-                fill_buffers(agent_buffer, envs_se, obs_buffer_se, actions_buffer_se, args.num_steps, device)
+                fill_buffers(agent_buffer, copy.deepcopy(envs_buffer[0]), obs_buffer_se, actions_buffer_se, args.num_steps, device)
                 b_obs_se = obs_buffer_se[:global_step].reshape((-1,) + envs.single_observation_space.shape)
                 b_actions_se = actions_buffer_se[:global_step].reshape((-1,) + envs.single_action_space.shape).long()
                 kl_mle_target = compute_se(agent, b_obs_se, b_actions_se, envs)
                 logs['sampling_error_on_policy_buffer'].append(kl_mle_target)
                 print(logs['sampling_error_on_policy_buffer'])
 
-                fill_buffers(agent_buffer, envs_se, obs_buffer_se, actions_buffer_se, args.num_steps, device)
+                fill_buffers(agent_buffer, envs_buffer[0], obs_buffer_se, actions_buffer_se, args.num_steps, device)
                 b_obs_se = obs_buffer_se[:args.num_steps].reshape((-1,) + envs.single_observation_space.shape)
                 b_actions_se = actions_buffer_se[:args.num_steps].reshape((-1,) + envs.single_action_space.shape).long()
                 kl_mle_target = compute_se(agent, b_obs_se, b_actions_se, envs)
@@ -788,8 +787,10 @@ def run():
             np.savez(f'{args.output_dir}/evaluations.npz', **logs)
 
             if args.track:
+                log_wandb = {}
                 for key, value in logs.items():
-                    wandb.log({key: value[-1]})
+                    log_wandb[key] = value[-1]
+                wandb.log(log_wandb)
 
 
             if args.save_policy:
