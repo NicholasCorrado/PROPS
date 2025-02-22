@@ -12,6 +12,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import tyro
+import yaml
+from stable_baselines3.common.utils import get_latest_run_id
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 
@@ -23,8 +25,6 @@ from wrappers import NormalizeObservation, NormalizeReward
 class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     """the name of this experiment"""
-    seed: int = 1
-    """seed of the experiment"""
     torch_deterministic: bool = True
     """if toggled, `torch.backends.cudnn.deterministic=False`"""
     cuda: bool = True
@@ -44,49 +44,62 @@ class Args:
     hf_entity: str = ""
     """the user or org name of the model repository from the Hugging Face Hub"""
 
+    # Logging
+    output_rootdir: str = 'results'
+    output_subdir: str = ''
+    run_id: int = None
+    seed: int = None
+    total_timesteps: int = 1000000
+
+    # Evaluation
+    num_evals: int = 40
+    eval_freq: int = 10
+    eval_episodes: int = 20
+    compute_sampling_error: bool = False
+
+    # Architecture arguments
+    linear: int = 0
+
+    # Learning algorithm
+    algo: str = 'ppo'
+
+    # Sampling algorithm
+    sampling_algo: str = 'on_policy'
+
     # Algorithm specific arguments
     env_id: str = "Hopper-v4"
-    """the id of the environment"""
     total_timesteps: int = 1000000
-    """total timesteps of the experiments"""
     learning_rate: float = 1e-3
-    """the learning rate of the optimizer"""
     num_envs: int = 1
-    """the number of parallel game environments"""
     num_steps: int = 2048
-    """the number of steps to run in each environment per policy rollout"""
     anneal_lr: bool = True
-    """Toggle learning rate annealing for policy and value networks"""
     gamma: float = 0.99
-    """the discount factor gamma"""
     gae_lambda: float = 0.95
-    """the lambda for the general advantage estimation"""
     num_minibatches: int = 32
-    """the number of mini-batches"""
     update_epochs: int = 10
-    """the K epochs to update the policy"""
     norm_adv: bool = True
-    """Toggles advantages normalization"""
     clip_coef: float = 0.2
-    """the surrogate clipping coefficient"""
     clip_vloss: bool = True
-    """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
-    ent_coef: float = 0.0
-    """coefficient of the entropy"""
+    ent_coef: float = 0.01
     vf_coef: float = 0.5
-    """coefficient of the value function"""
     max_grad_norm: float = 0.5
-    """the maximum norm for the gradient clipping"""
     target_kl: float = None
-    """the target KL divergence threshold"""
+    buffer_batches: int = 1
+
+    # Behavior
+    props_num_steps: int = 8
+    props_learning_rate: float = 1e-3
+    props_update_epochs: int = 16
+    props_num_minibatches: int = 16
+    props_clip_coef: float = 0.3
+    props_target_kl: float = 0.1
+    props_lambda: float = 0.0
+    props_freeze_features: bool = False
 
     # to be filled in runtime
     batch_size: int = 0
-    """the batch size (computed in runtime)"""
     minibatch_size: int = 0
-    """the mini-batch size (computed in runtime)"""
     num_iterations: int = 0
-    """the number of iterations (computed in runtime)"""
 
 
 def make_env(env_id, idx, capture_video, run_name, gamma):
@@ -156,38 +169,55 @@ class Agent(nn.Module):
             action = action_mean
         return action
 
+    def get_logprob(self, x, action):
+        action_mean = self.actor_mean(x)
+        action_logstd = self.actor_logstd.expand_as(action_mean)
+        action_std = torch.exp(action_logstd)
+        probs = Normal(action_mean, action_std)
+        return probs.log_prob(action)
+
 if __name__ == "__main__":
     args = tyro.cli(Args)
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    if args.track:
-        import wandb
+    args.eval_freq = max(args.num_iterations // args.num_evals, 1)
 
-        wandb.init(
-            project=args.wandb_project_name,
-            entity=args.wandb_entity,
-            sync_tensorboard=True,
-            config=vars(args),
-            name=run_name,
-            monitor_gym=True,
-            save_code=True,
-        )
-    writer = SummaryWriter(f"runs/{run_name}")
-    writer.add_text(
-        "hyperparameters",
-        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
-    )
+    args.props_batch_size = int(args.num_envs * args.props_num_steps)
+    args.props_minibatch_size = int(args.props_batch_size // args.props_num_minibatches)
+    props_iterations_per_target_update = args.num_steps // args.props_num_steps
 
-    # TRY NOT TO MODIFY: seeding
+    args.buffer_size = args.buffer_batches * args.num_steps
+
+    if args.sampling_algo in ['props', 'ros']:
+        assert args.num_steps % args.props_num_steps == 0
+
+    # Seeding
+    if args.run_id:
+        args.seed = args.run_id
+    elif args.seed is None:
+        args.seed = np.random.randint(2 ** 32 - 1)
+
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
+    # Output path setup
+    args.output_dir = f"{args.output_rootdir}/{args.env_id}/{args.algo}/{args.sampling_algo}/{args.output_subdir}"
+    if args.run_id is not None:
+        args.output_dir += f"/run_{args.run_id}"
+    else:
+        run_id = get_latest_run_id(log_path=args.output_dir, log_name='run_') + 1
+        args.output_dir += f"/run_{run_id}"
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    with open(os.path.join(args.output_dir, "config.yml"), "w") as f:
+        yaml.dump(args, f, sort_keys=True)
+
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
+    run_name = ""
     # env setup
     envs = gym.vector.SyncVectorEnv(
         [make_env(args.env_id, i, args.capture_video, run_name, args.gamma) for i in range(args.num_envs)]
@@ -239,13 +269,6 @@ if __name__ == "__main__":
             next_done = np.logical_or(terminations, truncations)
             rewards[step] = torch.tensor(reward).to(device).view(-1)
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
-
-            if "final_info" in infos:
-                for info in infos["final_info"]:
-                    if info and "episode" in info:
-                        print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                        writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                        writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
 
         # bootstrap value if not done
         with torch.no_grad():
@@ -329,19 +352,7 @@ if __name__ == "__main__":
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
-        # TRY NOT TO MODIFY: record rewards for plotting purposes
-        writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
-        writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
-        writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
-        writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
-        writer.add_scalar("losses/old_approx_kl", old_approx_kl.item(), global_step)
-        writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
-        writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
-        writer.add_scalar("losses/explained_variance", explained_var, global_step)
-        print("SPS:", int(global_step / (time.time() - start_time)))
-        writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
-
-        if iteration % 10 == 0:
+        if iteration % args.eval_freq == 0:
             envs_eval = copy.deepcopy(envs)
             envs_eval.envs[0].set_eval()
 
@@ -364,30 +375,8 @@ if __name__ == "__main__":
             )
 
     if args.save_model:
-        model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
+        model_path = f"{args.output_dir}/policy.pt"
         torch.save(agent.state_dict(), model_path)
         print(f"model saved to {model_path}")
-        from cleanrl_utils.evals.ppo_eval import evaluate
-
-        episodic_returns = evaluate(
-            model_path,
-            make_env,
-            args.env_id,
-            eval_episodes=10,
-            run_name=f"{run_name}-eval",
-            Model=Agent,
-            device=device,
-            gamma=args.gamma,
-        )
-        for idx, episodic_return in enumerate(episodic_returns):
-            writer.add_scalar("eval/episodic_return", episodic_return, idx)
-
-        if args.upload_model:
-            from cleanrl_utils.huggingface import push_to_hub
-
-            repo_name = f"{args.env_id}-{args.exp_name}-seed{args.seed}"
-            repo_id = f"{args.hf_entity}/{repo_name}" if args.hf_entity else repo_name
-            push_to_hub(args, episodic_returns, repo_id, "PPO", f"runs/{run_name}", f"videos/{run_name}-eval")
 
     envs.close()
-    writer.close()
