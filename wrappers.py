@@ -35,8 +35,6 @@ class NormalizeObservation(gym.wrappers.NormalizeObservation):
                 obs = self.normalize(obs)
             else:
                 obs = self.normalize(np.array([obs]))[0]
-        else:
-            print('obs', self.obs_rms.count)
         return obs, rews, terminateds, truncateds, infos
 
     def reset(self, **kwargs):
@@ -95,8 +93,6 @@ class NormalizeReward(gym.wrappers.NormalizeReward):
         self.returns = self.returns * self.gamma * (1 - terminateds) + rews
         if self.train:
             rews = self.normalize(rews)
-        else:
-            print('rew', self.return_rms.count)
         if not self.is_vector_env:
             rews = rews[0]
         return obs, rews, terminateds, truncateds, infos
