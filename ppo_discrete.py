@@ -674,9 +674,9 @@ def run():
 
             # Once the buffer is full, we only write to last batch in the buffer for all subsequent collection phases.
             buffer_pos += 1
-            buffer_pos = buffer_pos % args.buffer_size
-            # if buffer_pos == args.buffer_size:
-            #     buffer_pos = args.buffer_size - args.num_steps
+            # buffer_pos = buffer_pos % args.buffer_size
+            if buffer_pos == args.buffer_size:
+                buffer_pos = args.buffer_size - args.num_steps
 
             ################################## START BEHAVIOR UPDATE ##################################
             log_props = {}
