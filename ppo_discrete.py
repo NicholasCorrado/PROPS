@@ -364,8 +364,8 @@ def props_update(
             pg_loss2 = torch.clamp(ratio, 1 - args.props_clip_coef, 1 + args.props_clip_coef)
             pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-            kl_regularizer_loss = (torch.exp(b_logprobs[mb_inds])*(newlogprob - b_logprobs[mb_inds])).mean()
-            loss = pg_loss - args.props_lambda * kl_regularizer_loss
+            # kl_regularizer_loss = (torch.exp(newlogprob)*(newlogprob - b_logprobs[mb_inds])).mean()
+            loss = pg_loss #- args.props_lambda * kl_regularizer_loss
 
             optimizer.zero_grad()
             loss.backward()
@@ -674,20 +674,17 @@ def run():
 
             # Once the buffer is full, we only write to last batch in the buffer for all subsequent collection phases.
             buffer_pos += 1
-            if buffer_pos == args.buffer_size:
-                buffer_pos = args.buffer_size - args.num_steps
+            buffer_pos = buffer_pos % args.buffer_size
+            # if buffer_pos == args.buffer_size:
+            #     buffer_pos = args.buffer_size - args.num_steps
 
             ################################## START BEHAVIOR UPDATE ##################################
             log_props = {}
             if args.sampling_algo in ['props', 'ros'] and global_step % args.props_num_steps == 0: # and global_step >= args.num_steps:
 
-                if global_step > args.buffer_size:
-                    # Exclude the last behavior batch, size it will be evicted in the next collection phase
-                    obs = obs_buffer[:-args.props_num_steps]
-                    actions = actions_buffer[:-args.props_num_steps]
-                else:
-                    obs = obs_buffer[:global_step]
-                    actions = actions_buffer[:global_step]
+                end = buffer_pos if buffer_pos > 0 else args.buffer_size
+                obs = obs_buffer[:end]
+                actions = actions_buffer[:end]
                 with torch.no_grad():
                     logprobs = agent.get_logprob(obs, actions)
 
@@ -748,12 +745,13 @@ def run():
             print(logs['sampling_error'])
 
             if args.learning_rate > 0 and args.update_epochs > 0:
-                fill_buffers(agent_buffer, copy.deepcopy(envs_buffer[0]), obs_buffer_se, actions_buffer_se, args.num_steps, device)
-                b_obs_se = obs_buffer_se[:global_step].reshape((-1,) + envs.single_observation_space.shape)
-                b_actions_se = actions_buffer_se[:global_step].reshape((-1,) + envs.single_action_space.shape).long()
-                kl_mle_target = compute_se(agent, b_obs_se, b_actions_se, envs)
-                logs['sampling_error_on_policy_buffer'].append(kl_mle_target)
-                print(logs['sampling_error_on_policy_buffer'])
+                if args.buffer_batches > 1:
+                    fill_buffers(agent_buffer, copy.deepcopy(envs_buffer[0]), obs_buffer_se, actions_buffer_se, args.num_steps, device)
+                    b_obs_se = obs_buffer_se[:global_step].reshape((-1,) + envs.single_observation_space.shape)
+                    b_actions_se = actions_buffer_se[:global_step].reshape((-1,) + envs.single_action_space.shape).long()
+                    kl_mle_target = compute_se(agent, b_obs_se, b_actions_se, envs)
+                    logs['sampling_error_on_policy_buffer'].append(kl_mle_target)
+                    print(logs['sampling_error_on_policy_buffer'])
 
                 fill_buffers(agent_buffer, envs_buffer[0], obs_buffer_se, actions_buffer_se, args.num_steps, device)
                 b_obs_se = obs_buffer_se[:args.num_steps].reshape((-1,) + envs.single_observation_space.shape)
@@ -794,7 +792,7 @@ def run():
 
 
             if args.save_policy:
-                torch.save(agent, f"{args.output_dir}/policy.pt")
+                torch.save(agent, f"{args.output_dir}/policy_{global_step}.pt")
 
     envs.close()
     # writer.close()
