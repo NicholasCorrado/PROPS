@@ -1,0 +1,8 @@
+services:
+  dev:
+    build: .
+    volumes:
+      - .:/workspace
+    command: /bin/bash
+    stdin_open: true
+    tty: true
